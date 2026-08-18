@@ -1,0 +1,30 @@
+# The Dockerfile does `COPY . ./` after installing dependencies, so anything not
+# excluded here lands in the build context AND busts the layer cache on every
+# change. Keep this tight.
+
+# Installed inside the image from the lockfile – a host node_modules is the
+# wrong architecture and would shadow it.
+node_modules
+dist
+build
+coverage
+.nyc_output
+
+.git
+.github
+.gitignore
+
+# Never bake real environment values into an image. .env.example is kept: it is
+# documentation and contains no secrets.
+.env
+.env.*
+!.env.example
+
+*.log
+.DS_Store
+.vscode
+.idea
+
+# Tests are run by CI, not by the image build; excluding them keeps the context
+# small. tsconfig.build.json already excludes them from the compiled output.
+test

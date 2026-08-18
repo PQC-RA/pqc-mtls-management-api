@@ -1,0 +1,17 @@
+# Two ignores, both deliberate. Listed individually rather than lowering
+# failure-threshold, so any NEW warning still fails the build.
+ignored:
+  # DL3006 "always tag the version of an image explicitly"
+  # FROM ${BASE_OPENSSL_IMAGE} is stricter than a tag, not looser: CI passes a
+  # full sha256 digest read from base.lock. hadolint cannot resolve the ARG and
+  # so cannot see the pin.
+  - DL3006
+
+  # DL3008 "pin versions in apt get install"
+  # nodejs IS pinned (22.23.1-1nodesource1) and asserted afterwards, because an
+  # unpinned fallback to Ubuntu's Node 18 breaks the ESM-only `jose` dependency.
+  # ca-certificates, curl and gnupg are deliberately unpinned: they are fetched
+  # only to add the NodeSource repo, and pinning them makes the build fail on
+  # every Ubuntu point release for no security benefit – the base image itself
+  # is digest-pinned, which is where reproducibility actually comes from.
+  - DL3008

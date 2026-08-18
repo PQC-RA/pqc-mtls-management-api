@@ -1,0 +1,150 @@
+# checks.yml – lint, type-check and unit tests for every push and pull request.
+#
+# The suite runs hermetically: no lab, no custodian, and no network egress. A
+# spec that mocks `fs` while the service under test reaches the custodian over
+# HTTP would otherwise make a real outbound call and pass only on a machine
+# where the stack happens to be running. test/jest.setup.ts fails any test that
+# attempts an outbound call, so that class of false pass cannot occur here.
+name: checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node:
+    name: typecheck · lint · test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # Version comes from package.json's packageManager field, so the runner
+      # resolves the same pnpm the lockfile was written under.
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      # Pinned to 22 to match the runtime image, not read from engines: the
+      # engines range is ">=22" and setup-node would resolve it to whatever the
+      # newest matching release is, testing a Node the image never runs.
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm exec tsc --noEmit -p tsconfig.json
+
+      # `lint` runs eslint --fix, which mutates the tree and can only ever pass.
+      # lint:ci is the non-mutating form.
+      - name: Lint
+        run: pnpm run lint:ci
+
+      - name: Test
+        run: pnpm exec jest --ci
+
+      - name: Build
+        run: pnpm build
+
+  image:
+    name: image builds
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # The base image is not public yet, so even a read needs a token.
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve the pinned base image
+        id: base
+        run: |
+          set -euo pipefail
+          image=$(jq -er '.image' base.lock)
+          digest=$(jq -er '.digest' base.lock)
+          echo "ref=${image}@${digest}" >> "$GITHUB_OUTPUT"
+
+      # amd64 only on PRs – this is a "does it build" gate, and the arm64 half
+      # is covered by publish.yml on main. Building both here would roughly
+      # double PR latency for no extra signal.
+      - name: Build (amd64)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          build-args: BASE_OPENSSL_IMAGE=${{ steps.base.outputs.ref }}
+          push: false
+          load: true
+          tags: pqc-mtls-management-api:pr
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Catches the class of defect where the image builds but cannot start –
+      # a missing dist/main.js, an ESM/CJS require failure, or a base image
+      # without the PQ algorithms the cert endpoints depend on.
+      #
+      # Run with NO environment: the image must be correct standalone. The
+      # openssl.cnf defect this guards against was invisible for exactly the
+      # opposite reason – the gateway's compose supplied OPENSSL_CONF, so the
+      # broken image only ever ran in the one context that fixed it.
+      - name: Smoke-test the built image
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint node pqc-mtls-management-api:pr \
+            -e 'require("fs").accessSync("/usr/src/app/dist/main.js")'
+          test "$(docker run --rm --entrypoint id pqc-mtls-management-api:pr -u)" = 1001
+          # The CSR path certs.service.ts depends on, end to end. `list
+          # -signature-algorithms` alone passes on an image whose `req` is
+          # entirely broken, so assert the round-trip instead.
+          docker run --rm --entrypoint sh pqc-mtls-management-api:pr -c '
+            set -eu
+            O=/opt/openssl-3.6.2/bin/openssl
+            printf "[req]\ndistinguished_name=dn\nprompt=no\n[dn]\nCN=ci-probe\n" > /tmp/p.cnf
+            "$O" req -new -newkey ML-DSA-65 -keyout /tmp/p.key -out /tmp/p.csr -nodes -config /tmp/p.cnf
+            "$O" req -verify -in /tmp/p.csr -noout
+            "$O" req -in /tmp/p.csr -noout -subject | grep -q ci-probe'
+
+  static:
+    name: static analysis
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install actionlint (pinned)
+        run: |
+          set -euo pipefail
+          curl -fsSL https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz \
+            | tar -xz -C /tmp actionlint
+          sudo install -m 0755 /tmp/actionlint /usr/local/bin/actionlint
+
+      - name: actionlint
+        run: actionlint
+
+      - name: hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile

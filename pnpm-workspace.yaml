@@ -1,0 +1,5 @@
+allowBuilds:
+  '@nestjs/core': true
+  '@scarf/scarf': false
+  protobufjs: true
+  unrs-resolver: true
