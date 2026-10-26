@@ -21,7 +21,20 @@ export interface TokenMeta {
 	expiresAt: number;
 	allowedCn: string; // CSR subject CN must match this exactly before the token is consumed
 	usedAt?: number;
+	/** Renewal profile the certificate is issued under; absent = the legacy 365-day path. */
+	profile?: "client-30d" | "demo-120s";
+	/** Set while a signing is in flight: only a commit or a release clears it. */
+	reservation?: { id: string; until: number };
+	/** Serial of the certificate issued under this token (set on commit). */
+	serial?: string;
 }
+
+export type ReserveResult =
+	| { result: "ok"; reservationId: string; meta: TokenMeta }
+	| { result: "in_progress" }
+	| { result: "stale_reservation"; reservationId: string; meta: TokenMeta }
+	| { result: "already_used"; serial?: string }
+	| { result: "not_found" | "expired" | "cn_mismatch" };
 
 export type ConsumeResult =
 	| "ok"
@@ -52,6 +65,51 @@ if pttl > 0 then
 else
   redis.call('SET', KEYS[1], cjson.encode(meta))
 end
+return 'ok'
+`;
+
+/**
+ * Reserve (item 4): the same checks as CONSUME_SCRIPT, but instead of marking
+ * the token used it records a reservation with a lease. A live reservation
+ * blocks a second request (in_progress); an expired one is returned as
+ * stale_reservation so the caller can reconcile it with the custodian before
+ * anything else happens.
+ */
+const RESERVE_SCRIPT = `
+local val = redis.call('GET', KEYS[1])
+if not val then return cjson.encode({result='not_found'}) end
+local meta = cjson.decode(val)
+if meta.usedAt then return cjson.encode({result='already_used', serial=meta.serial}) end
+local now = tonumber(ARGV[1])
+if meta.expiresAt < now and not meta.reservation then
+  redis.call('DEL', KEYS[1])
+  return cjson.encode({result='expired'})
+end
+if meta.allowedCn ~= (ARGV[2] or '') then return cjson.encode({result='cn_mismatch'}) end
+if meta.reservation then
+  if meta.reservation['until'] > now then return cjson.encode({result='in_progress'}) end
+  return cjson.encode({result='stale_reservation', reservationId=meta.reservation.id, meta=meta})
+end
+meta.reservation = {id=ARGV[3], ['until']=now + tonumber(ARGV[4])}
+local pttl = redis.call('PTTL', KEYS[1])
+local keep = math.max(pttl, tonumber(ARGV[4]) + 600000)
+redis.call('SET', KEYS[1], cjson.encode(meta), 'PX', keep)
+return cjson.encode({result='ok', reservationId=ARGV[3], meta=meta})
+`;
+
+/** Commit or release, conditional on the reservation id. ARGV: id, action, serial, now. */
+const SETTLE_SCRIPT = `
+local val = redis.call('GET', KEYS[1])
+if not val then return 'not_found' end
+local meta = cjson.decode(val)
+if not meta.reservation or meta.reservation.id ~= ARGV[1] then return 'not_reserved_by_caller' end
+meta.reservation = nil
+if ARGV[2] == 'commit' then
+  meta.usedAt = tonumber(ARGV[4])
+  meta.serial = ARGV[3]
+end
+local pttl = redis.call('PTTL', KEYS[1])
+if pttl > 0 then redis.call('SET', KEYS[1], cjson.encode(meta), 'PX', pttl) else redis.call('SET', KEYS[1], cjson.encode(meta)) end
 return 'ok'
 `;
 
@@ -178,6 +236,126 @@ export class TokenStoreService implements OnModuleDestroy {
 			meta.usedAt = now;
 			return "ok";
 		}
+	}
+
+	// ── Reserve then commit (item 4) ─────────────────────────────────────────
+
+	async reserve(
+		token: string,
+		cn: string,
+		reservationId: string,
+		leaseMs: number
+	): Promise<ReserveResult> {
+		const now = Date.now();
+		if (this.redis) {
+			const raw = await this.redis.eval(
+				RESERVE_SCRIPT,
+				1,
+				KEY_PREFIX + token,
+				String(now),
+				cn,
+				reservationId,
+				String(leaseMs)
+			);
+			return JSON.parse(raw as string) as ReserveResult;
+		}
+		const meta = this.local.get(token);
+		if (!meta) return { result: "not_found" };
+		if (meta.usedAt !== undefined)
+			return { result: "already_used", serial: meta.serial };
+		if (now > meta.expiresAt && !meta.reservation) {
+			this.local.delete(token);
+			return { result: "expired" };
+		}
+		if (meta.allowedCn !== cn) return { result: "cn_mismatch" };
+		if (meta.reservation) {
+			if (meta.reservation.until > now) return { result: "in_progress" };
+			return {
+				result: "stale_reservation",
+				reservationId: meta.reservation.id,
+				meta,
+			};
+		}
+		meta.reservation = { id: reservationId, until: now + leaseMs };
+		return { result: "ok", reservationId, meta };
+	}
+
+	async commit(
+		token: string,
+		reservationId: string,
+		serial: string
+	): Promise<string> {
+		return this.settle(token, reservationId, "commit", serial);
+	}
+
+	async release(token: string, reservationId: string): Promise<string> {
+		return this.settle(token, reservationId, "release", "");
+	}
+
+	private async settle(
+		token: string,
+		reservationId: string,
+		action: "commit" | "release",
+		serial: string
+	): Promise<string> {
+		const now = Date.now();
+		if (this.redis) {
+			return (await this.redis.eval(
+				SETTLE_SCRIPT,
+				1,
+				KEY_PREFIX + token,
+				reservationId,
+				action,
+				serial,
+				String(now)
+			)) as string;
+		}
+		const meta = this.local.get(token);
+		if (!meta) return "not_found";
+		if (!meta.reservation || meta.reservation.id !== reservationId)
+			return "not_reserved_by_caller";
+		delete meta.reservation;
+		if (action === "commit") {
+			meta.usedAt = now;
+			meta.serial = serial;
+		}
+		return "ok";
+	}
+
+	/** Tokens whose reservation lease has passed, for the periodic reconcile. */
+	async staleReservations(): Promise<
+		Array<{ token: string; reservationId: string; meta: TokenMeta }>
+	> {
+		const now = Date.now();
+		const out: Array<{
+			token: string;
+			reservationId: string;
+			meta: TokenMeta;
+		}> = [];
+		if (this.redis) {
+			const tokens = await this.redis.zrange(INDEX_KEY, 0, -1);
+			for (const t of tokens) {
+				const raw = await this.redis.get(KEY_PREFIX + t);
+				if (!raw) continue;
+				const meta = JSON.parse(raw) as TokenMeta;
+				if (meta.reservation && meta.reservation.until <= now)
+					out.push({
+						token: t,
+						reservationId: meta.reservation.id,
+						meta,
+					});
+			}
+			return out;
+		}
+		for (const [t, meta] of this.local.entries()) {
+			if (meta.reservation && meta.reservation.until <= now)
+				out.push({
+					token: t,
+					reservationId: meta.reservation.id,
+					meta,
+				});
+		}
+		return out;
 	}
 
 	// ── List ─────────────────────────────────────────────────────────────────

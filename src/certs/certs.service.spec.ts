@@ -99,6 +99,16 @@ describe("CertsService", () => {
 			get: jest.fn().mockResolvedValue(null),
 			delete: jest.fn().mockResolvedValue(false),
 			consume: jest.fn().mockResolvedValue("ok"),
+			reserve: jest.fn((_t: string, cn: string, id: string) =>
+				Promise.resolve({
+					result: "ok",
+					reservationId: id,
+					meta: { expiresAt: Date.now() + 60_000, allowedCn: cn },
+				})
+			),
+			commit: jest.fn().mockResolvedValue("ok"),
+			release: jest.fn().mockResolvedValue("ok"),
+			staleReservations: jest.fn().mockResolvedValue([]),
 			list: jest.fn().mockResolvedValue([]),
 			onModuleDestroy: jest.fn().mockResolvedValue(undefined),
 		} as any;
@@ -310,8 +320,6 @@ describe("CertsService", () => {
 		}
 
 		beforeEach(async () => {
-			const tokenStore = (service as any).tokenStore as jest.Mocked<any>;
-			tokenStore.consume.mockResolvedValue("ok");
 			token = await service.createEnrollmentToken(3600, "test-cn");
 
 			// Stub all fs operations
@@ -332,7 +340,7 @@ describe("CertsService", () => {
 		it("throws 403 when enrollment token is invalid", async () => {
 			setupExecSuccess();
 			const tokenStore = (service as any).tokenStore as jest.Mocked<any>;
-			tokenStore.consume.mockResolvedValue("not_found");
+			tokenStore.reserve.mockResolvedValueOnce({ result: "not_found" });
 			await expect(
 				service.signCsr(FAKE_CSR_PEM, "enroll_invalid")
 			).rejects.toMatchObject({ status: HttpStatus.FORBIDDEN });
@@ -341,7 +349,7 @@ describe("CertsService", () => {
 		it("throws 403 when CSR CN does not match token constraint", async () => {
 			setupExecSuccess();
 			const tokenStore = (service as any).tokenStore as jest.Mocked<any>;
-			tokenStore.consume.mockResolvedValue("cn_mismatch");
+			tokenStore.reserve.mockResolvedValueOnce({ result: "cn_mismatch" });
 			await expect(
 				service.signCsr(FAKE_CSR_PEM, token)
 			).rejects.toMatchObject({ status: HttpStatus.FORBIDDEN });
@@ -363,28 +371,400 @@ describe("CertsService", () => {
 			});
 		});
 
-		it("propagates a 502 when the custodian rejects the signing request", async () => {
-			// Signing itself now happens inside pqc-ca-custodian (the only
-			// component with intermediate-key access) over HTTP, not via a local
-			// `openssl ca` exec – so a signing-side failure surfaces as
-			// custodianRequest's generic non-404/409 mapping (BAD_GATEWAY), which
-			// signCsr's catch block re-throws as-is (isKnownHttpException).
+		it("returns the signed certificate and commits the reservation", async () => {
 			setupExecSuccess();
+			const tokenStore = (service as any).tokenStore as jest.Mocked<any>;
+			await service.signCsr(FAKE_CSR_PEM, token);
+			expect(tokenStore.commit).toHaveBeenCalledWith(
+				token,
+				expect.any(String),
+				"1007"
+			);
+			expect(tokenStore.release).not.toHaveBeenCalled();
+		});
+
+		it("releases the token when the custodian refuses before signing", async () => {
+			setupExecSuccess();
+			const tokenStore = (service as any).tokenStore as jest.Mocked<any>;
 			jest.spyOn(
 				caCustodianUtil,
 				"signCsrViaCustodian"
-			).mockRejectedValue(
-				new HttpException(
-					"CA custodian request failed",
-					HttpStatus.BAD_GATEWAY
+			).mockRejectedValueOnce(
+				new caCustodianUtil.CustodianHttpException(
+					"refused",
+					HttpStatus.CONFLICT,
+					"refused",
+					"cn_already_active"
 				)
 			);
-
 			await expect(
 				service.signCsr(FAKE_CSR_PEM, token)
-			).rejects.toMatchObject({
-				status: HttpStatus.BAD_GATEWAY,
+			).rejects.toMatchObject({ status: HttpStatus.CONFLICT });
+			expect(tokenStore.release).toHaveBeenCalled();
+			expect(tokenStore.commit).not.toHaveBeenCalled();
+		});
+
+		it("releases the token when the request never reached the custodian (custodian stopped)", async () => {
+			setupExecSuccess();
+			const tokenStore = (service as any).tokenStore as jest.Mocked<any>;
+			jest.spyOn(
+				caCustodianUtil,
+				"signCsrViaCustodian"
+			).mockRejectedValueOnce(
+				new caCustodianUtil.CustodianHttpException(
+					"down",
+					HttpStatus.BAD_GATEWAY,
+					"not_sent",
+					"ENOTFOUND"
+				)
+			);
+			await expect(
+				service.signCsr(FAKE_CSR_PEM, token)
+			).rejects.toMatchObject({ status: HttpStatus.BAD_GATEWAY });
+			expect(tokenStore.release).toHaveBeenCalled();
+		});
+
+		it("on an ambiguous failure, commits if the custodian did issue", async () => {
+			setupExecSuccess();
+			const tokenStore = (service as any).tokenStore as jest.Mocked<any>;
+			jest.spyOn(
+				caCustodianUtil,
+				"signCsrViaCustodian"
+			).mockRejectedValueOnce(
+				new caCustodianUtil.CustodianHttpException(
+					"timeout",
+					HttpStatus.BAD_GATEWAY,
+					"ambiguous"
+				)
+			);
+			jest.spyOn(
+				caCustodianUtil,
+				"fetchSignResultViaCustodian"
+			).mockResolvedValueOnce({
+				state: "issued",
+				certificate: FAKE_CERT_PEM,
+				serialNumber: "1008",
+				expiresAt: "2027-01-01T00:00:00.000Z",
 			});
+			const result = await service.signCsr(FAKE_CSR_PEM, token);
+			expect(result.serialNumber).toBe("1008");
+			expect(tokenStore.commit).toHaveBeenCalledWith(
+				token,
+				expect.any(String),
+				"1008"
+			);
+			expect(tokenStore.release).not.toHaveBeenCalled();
+		});
+
+		it("on an ambiguous failure, releases if the custodian has no certificate", async () => {
+			setupExecSuccess();
+			const tokenStore = (service as any).tokenStore as jest.Mocked<any>;
+			jest.spyOn(
+				caCustodianUtil,
+				"signCsrViaCustodian"
+			).mockRejectedValueOnce(
+				new caCustodianUtil.CustodianHttpException(
+					"timeout",
+					HttpStatus.BAD_GATEWAY,
+					"ambiguous"
+				)
+			);
+			jest.spyOn(
+				caCustodianUtil,
+				"fetchSignResultViaCustodian"
+			).mockResolvedValueOnce({ state: "none" });
+			await expect(
+				service.signCsr(FAKE_CSR_PEM, token)
+			).rejects.toMatchObject({ status: HttpStatus.BAD_GATEWAY });
+			expect(tokenStore.release).toHaveBeenCalled();
+			expect(tokenStore.commit).not.toHaveBeenCalled();
+		});
+
+		it("keeps the reservation when the custodian cannot be asked after an ambiguous failure", async () => {
+			setupExecSuccess();
+			const tokenStore = (service as any).tokenStore as jest.Mocked<any>;
+			jest.spyOn(
+				caCustodianUtil,
+				"signCsrViaCustodian"
+			).mockRejectedValueOnce(
+				new caCustodianUtil.CustodianHttpException(
+					"timeout",
+					HttpStatus.BAD_GATEWAY,
+					"ambiguous"
+				)
+			);
+			jest.spyOn(
+				caCustodianUtil,
+				"fetchSignResultViaCustodian"
+			).mockRejectedValueOnce(new Error("still down"));
+			await expect(
+				service.signCsr(FAKE_CSR_PEM, token)
+			).rejects.toMatchObject({ status: HttpStatus.BAD_GATEWAY });
+			expect(tokenStore.release).not.toHaveBeenCalled();
+			expect(tokenStore.commit).not.toHaveBeenCalled();
+		});
+
+		it("answers 409 while another enrollment with the token is in progress", async () => {
+			setupExecSuccess();
+			const tokenStore = (service as any).tokenStore as jest.Mocked<any>;
+			tokenStore.reserve.mockResolvedValueOnce({ result: "in_progress" });
+			await expect(
+				service.signCsr(FAKE_CSR_PEM, token)
+			).rejects.toMatchObject({ status: HttpStatus.CONFLICT });
+		});
+
+		it("names the reason of a token failure in a machine-readable code", async () => {
+			setupExecSuccess();
+			const tokenStore = (service as any).tokenStore as jest.Mocked<any>;
+			for (const [result, status, reason] of [
+				["in_progress", HttpStatus.CONFLICT, "in_progress"],
+				["already_used", HttpStatus.FORBIDDEN, "token_already_used"],
+				["expired", HttpStatus.FORBIDDEN, "token_expired"],
+				["cn_mismatch", HttpStatus.FORBIDDEN, "cn_mismatch"],
+				["not_found", HttpStatus.FORBIDDEN, "token_invalid"],
+			] as const) {
+				tokenStore.reserve.mockResolvedValueOnce({ result });
+				const err = await service
+					.signCsr(FAKE_CSR_PEM, token)
+					.catch(e => e);
+				expect(err.getStatus()).toBe(status);
+				expect(err.getResponse()).toMatchObject({ error: reason });
+			}
+		});
+
+		describe("enrollment replay with the same key (R5)", () => {
+			const realFs = jest.requireActual("fs") as typeof fs;
+			const fx = (n: string) =>
+				realFs.readFileSync(
+					require("path").join(__dirname, "__fixtures__", n),
+					"utf8"
+				);
+			const crypto = require("crypto");
+			const spkiOf = (pem: string) =>
+				crypto
+					.createHash("sha256")
+					.update(
+						new crypto.X509Certificate(pem).publicKey.export({
+							type: "spki",
+							format: "der",
+						})
+					)
+					.digest("hex");
+			function arrange(
+				issuedPem: string,
+				indexStatus = "V",
+				csrKeyOf = "enroll.crt"
+			) {
+				setupExecSuccess();
+				const tokenStore = (service as any)
+					.tokenStore as jest.Mocked<any>;
+				tokenStore.reserve.mockResolvedValueOnce({
+					result: "already_used",
+					serial: "10C6",
+				});
+				jest.spyOn(
+					service as any,
+					"extractCsrCn"
+				).mockResolvedValueOnce("replay-fixture");
+				// the CSR in the request carries key A, as enroll.crt does
+				jest.spyOn(
+					service as any,
+					"spkiSha256OfCsrFile"
+				).mockResolvedValueOnce(spkiOf(fx(csrKeyOf)));
+				jest.spyOn(
+					caCustodianUtil,
+					"fetchIssuedPemViaCustodian"
+				).mockResolvedValueOnce(
+					"Certificate:\n    text dump\n" + issuedPem
+				);
+				jest.spyOn(
+					caCustodianUtil,
+					"fetchIndexViaCustodian"
+				).mockResolvedValueOnce(
+					`${indexStatus}\t361026000000Z\t${indexStatus === "R" ? "261025000000Z,keyCompromise" : ""}\t10C6\tunknown\t/CN=replay-fixture\n`
+				);
+			}
+			it("gives the committed certificate back to a retry with the same key", async () => {
+				arrange(fx("enroll.crt"));
+				const r: any = await service.signCsr(fx("enroll.csr"), token);
+				expect(r.replay).toBe(true);
+				expect(r.serialNumber).toBe("10C6");
+				expect(r.certificate).toContain("BEGIN CERTIFICATE");
+			});
+			it("refuses a retry with a different key (403 token_already_used)", async () => {
+				arrange(fx("other-key.crt"));
+				const err = await service
+					.signCsr(fx("enroll.csr"), token)
+					.catch(e => e);
+				expect(err.getStatus()).toBe(HttpStatus.FORBIDDEN);
+				expect(err.getResponse()).toMatchObject({
+					error: "token_already_used",
+				});
+			});
+			it("refuses when the committed certificate names another CN", async () => {
+				arrange(fx("other-cn.crt"));
+				const err = await service
+					.signCsr(fx("enroll.csr"), token)
+					.catch(e => e);
+				expect(err.getStatus()).toBe(HttpStatus.FORBIDDEN);
+			});
+			it("audits a used token tried with another key apart (token.replay_mismatch)", async () => {
+				arrange(fx("other-key.crt"));
+				await service
+					.signCsr(fx("enroll.csr"), token)
+					.catch(() => undefined);
+				expect((service as any).adminAudit.append).toHaveBeenCalledWith(
+					expect.objectContaining({
+						action: "token.replay_mismatch",
+						params: expect.objectContaining({
+							reason: "replay_key_mismatch",
+						}),
+					})
+				);
+			});
+			it("audits a replay as cert.enroll.replay, not as a new issuance", async () => {
+				arrange(fx("enroll.crt"));
+				await service.signCsr(fx("enroll.csr"), token);
+				expect((service as any).adminAudit.append).toHaveBeenCalledWith(
+					expect.objectContaining({ action: "cert.enroll.replay" })
+				);
+			});
+			it("answers 503 replay_unavailable (retry) when the custodian cannot be asked", async () => {
+				setupExecSuccess();
+				const tokenStore = (service as any)
+					.tokenStore as jest.Mocked<any>;
+				tokenStore.reserve.mockResolvedValueOnce({
+					result: "already_used",
+					serial: "10C6",
+				});
+				jest.spyOn(
+					service as any,
+					"extractCsrCn"
+				).mockResolvedValueOnce("replay-fixture");
+				jest.spyOn(
+					caCustodianUtil,
+					"fetchIssuedPemViaCustodian"
+				).mockRejectedValueOnce(new Error("custodian down"));
+				const err = await service
+					.signCsr(fx("enroll.csr"), token)
+					.catch(e => e);
+				expect(err.getStatus()).toBe(HttpStatus.SERVICE_UNAVAILABLE);
+				expect(err.getResponse()).toMatchObject({
+					error: "replay_unavailable",
+					retryAfterSeconds: 30,
+				});
+			});
+			it("refuses a revoked committed certificate (403 certificate_revoked)", async () => {
+				arrange(fx("enroll.crt"), "R");
+				const err = await service
+					.signCsr(fx("enroll.csr"), token)
+					.catch(e => e);
+				expect(err.getStatus()).toBe(HttpStatus.FORBIDDEN);
+				expect(err.getResponse()).toMatchObject({
+					error: "certificate_revoked",
+				});
+			});
+			it("refuses an expired committed certificate (403 certificate_expired)", async () => {
+				arrange(fx("expired.crt"), "V", "expired.crt");
+				const err = await service
+					.signCsr(fx("enroll.csr"), token)
+					.catch(e => e);
+				expect(err.getStatus()).toBe(HttpStatus.FORBIDDEN);
+				expect(err.getResponse()).toMatchObject({
+					error: "certificate_expired",
+				});
+			});
+			it("replays on the stale-reservation path too, when the reconcile finds the certificate", async () => {
+				setupExecSuccess();
+				const tokenStore = (service as any)
+					.tokenStore as jest.Mocked<any>;
+				tokenStore.reserve.mockResolvedValueOnce({
+					result: "stale_reservation",
+					reservationId: "old",
+					meta: { expiresAt: 0, allowedCn: "replay-fixture" },
+				});
+				jest.spyOn(
+					service as any,
+					"extractCsrCn"
+				).mockResolvedValueOnce("replay-fixture");
+				jest.spyOn(
+					service as any,
+					"spkiSha256OfCsrFile"
+				).mockResolvedValueOnce(spkiOf(fx("enroll.crt")));
+				jest.spyOn(
+					caCustodianUtil,
+					"fetchSignResultViaCustodian"
+				).mockResolvedValueOnce({
+					state: "issued",
+					certificate: fx("enroll.crt"),
+					serialNumber: "10C6",
+					expiresAt: "",
+				});
+				jest.spyOn(
+					caCustodianUtil,
+					"fetchIndexViaCustodian"
+				).mockResolvedValueOnce(
+					"V\t361026000000Z\t\t10C6\tunknown\t/CN=replay-fixture\n"
+				);
+				const r: any = await service.signCsr(fx("enroll.csr"), token);
+				expect(r.replay).toBe(true);
+				expect(tokenStore.commit).toHaveBeenCalledWith(
+					token,
+					"old",
+					"10C6"
+				);
+			});
+		});
+
+		it("names the CN in the audit entry of a reconcile release", async () => {
+			setupExecSuccess();
+			const tokenStore = (service as any).tokenStore as jest.Mocked<any>;
+			const audit = (service as any).adminAudit;
+			tokenStore.staleReservations = jest.fn().mockResolvedValue([
+				{
+					token,
+					reservationId: "r1",
+					meta: { expiresAt: 0, allowedCn: "lost-cn" },
+				},
+			]);
+			jest.spyOn(
+				caCustodianUtil,
+				"fetchSignResultViaCustodian"
+			).mockResolvedValueOnce({ state: "none" });
+			await service.reconcileStaleReservations();
+			expect(audit.append).toHaveBeenCalledWith(
+				expect.objectContaining({
+					action: "token.release",
+					target: "cn=lost-cn",
+				})
+			);
+		});
+
+		it("treats a stale reservation the custodian completed as an already-used token", async () => {
+			setupExecSuccess();
+			const tokenStore = (service as any).tokenStore as jest.Mocked<any>;
+			tokenStore.reserve.mockResolvedValueOnce({
+				result: "stale_reservation",
+				reservationId: "old",
+				meta: { expiresAt: 0, allowedCn: "test-cn" },
+			});
+			jest.spyOn(
+				caCustodianUtil,
+				"fetchSignResultViaCustodian"
+			).mockResolvedValueOnce({
+				state: "issued",
+				certificate: FAKE_CERT_PEM,
+				serialNumber: "1009",
+				expiresAt: "",
+			});
+			await expect(
+				service.signCsr(FAKE_CSR_PEM, token)
+			).rejects.toMatchObject({ status: HttpStatus.FORBIDDEN });
+			expect(tokenStore.commit).toHaveBeenCalledWith(
+				token,
+				"old",
+				"1009"
+			);
 		});
 	});
 
@@ -836,13 +1216,13 @@ describe("CertsService", () => {
 				// Message reflects the decoupled (least-privilege) flow.
 				expect(result.message).toMatch(/revoked successfully/i);
 				expect(result.message).toMatch(/signaled/i);
-				// The sentinel was written for the dedicated renewer...
+				// The sentinel was written for the dedicated renewer…
 				expect(writeFileSync).toHaveBeenCalledWith(
 					SIGNAL,
 					expect.any(String),
 					expect.anything()
 				);
-				// ...and the broad CRL script was NEVER executed in-process.
+				// …and the broad CRL script was NEVER executed in-process.
 				expect(calledBinaries).not.toContain("/bin/bash");
 			} finally {
 				delete process.env.CRL_RENEW_SIGNAL_FILE;

@@ -165,10 +165,28 @@ export class CertsController {
 		example: 86400,
 		description: "Token TTL in seconds (default: 86400 = 24 h)",
 	})
+	@ApiQuery({
+		name: "profile",
+		required: false,
+		example: "client-30d",
+		description:
+			"Renewal profile for the certificate (client-30d or demo-120s). Accepted only when renewal is enabled on this deployment; omitted = the standard 365-day certificate.",
+	})
 	async createEnrollmentToken(
 		@Query("cn") cn: string,
-		@Query("ttl", new DefaultValuePipe(86400), ParseIntPipe) ttl: number
+		@Query("ttl", new DefaultValuePipe(86400), ParseIntPipe) ttl: number,
+		@Query("profile") profile?: string
 	): Promise<EnrollmentTokenDto> {
+		if (
+			profile !== undefined &&
+			profile !== "client-30d" &&
+			profile !== "demo-120s"
+		) {
+			throw new HttpException(
+				"profile must be client-30d or demo-120s",
+				HttpStatus.BAD_REQUEST
+			);
+		}
 		if (!cn || cn.trim() === "") {
 			throw new HttpException(
 				"cn query parameter is required – specify the CN the CSR must contain",
@@ -179,7 +197,8 @@ export class CertsController {
 		const expiresAt = Date.now() + ttl * 1000;
 		const token = await this.certsService.createEnrollmentToken(
 			ttl,
-			allowedCn
+			allowedCn,
+			profile as "client-30d" | "demo-120s" | undefined
 		);
 		return { token, expiresAt, allowedCn };
 	}

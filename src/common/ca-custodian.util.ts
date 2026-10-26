@@ -34,27 +34,70 @@ function getCustodianHmacSecret(): string {
 	}
 }
 
+/**
+ * How a failed custodian call must be treated by a caller that holds a
+ * reservation:
+ *   refused   the custodian answered and did not sign (safe to release)
+ *   not_sent  the request never reached the custodian (safe to release)
+ *   ambiguous the custodian may have signed (reconcile before releasing)
+ */
+export type CustodianErrorKind = "refused" | "not_sent" | "ambiguous";
+
+export class CustodianHttpException extends HttpException {
+	constructor(
+		message: string,
+		status: HttpStatus,
+		readonly kind: CustodianErrorKind,
+		readonly code?: string,
+		readonly details?: Record<string, unknown>
+	) {
+		super(message, status);
+	}
+}
+
+const NOT_SENT_CODES = new Set([
+	"ENOTFOUND",
+	"EAI_AGAIN",
+	"ECONNREFUSED",
+	"EHOSTUNREACH",
+	"ENETUNREACH",
+]);
+
+function sha256Hex(data: string | Buffer): string {
+	return crypto.createHash("sha256").update(data).digest("hex");
+}
+
 async function custodianRequest<T>(
 	logger: Logger,
 	method: "GET" | "POST",
 	pathSegment: string,
-	body?: unknown
+	body?: unknown,
+	timeoutMs = 15_000
 ): Promise<T> {
 	const secret = getCustodianHmacSecret();
 	if (!secret) {
 		logger.error(
 			"custodian-hmac secret not configured – refusing to call pqc-ca-custodian"
 		);
-		throw new HttpException(
+		throw new CustodianHttpException(
 			"CA custodian is not configured",
-			HttpStatus.INTERNAL_SERVER_ERROR
+			HttpStatus.INTERNAL_SERVER_ERROR,
+			"not_sent"
 		);
 	}
 
+	// Request authentication v2: method, path, timestamp, nonce and the body
+	// hash are all covered, so a captured request cannot be replayed.
 	const bodyStr = body !== undefined ? JSON.stringify(body) : "";
+	const ts = String(Date.now());
+	const nonce = crypto.randomBytes(16).toString("hex");
+	const mac = (data: string) =>
+		crypto.createHmac("sha256", secret).update(data).digest("hex");
 	const sig =
 		"sha256=" +
-		crypto.createHmac("sha256", secret).update(bodyStr).digest("hex");
+		mac(
+			`v2\n${method}\n${pathSegment}\n${ts}\n${nonce}\n${sha256Hex(bodyStr)}`
+		);
 
 	let response: Response;
 	try {
@@ -63,50 +106,103 @@ async function custodianRequest<T>(
 			headers: {
 				"Content-Type": "application/json",
 				"X-Hub-Signature-256": sig,
+				"X-Custodian-Timestamp": ts,
+				"X-Custodian-Nonce": nonce,
 			},
 			body: body !== undefined ? bodyStr : undefined,
-			signal: AbortSignal.timeout(15_000),
+			signal: AbortSignal.timeout(timeoutMs),
 		});
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
+		const code = (error as { cause?: { code?: string } })?.cause?.code;
+		const kind: CustodianErrorKind =
+			code && NOT_SENT_CODES.has(code) ? "not_sent" : "ambiguous";
 		logger.error(
-			`CA custodian call failed (${method} ${pathSegment}): ${message}`
+			`CA custodian call failed (${method} ${pathSegment}): ${message} [${code ?? "no code"}, ${kind}]`
 		);
-		throw new HttpException(
+		throw new CustodianHttpException(
 			"Failed to contact CA custodian",
-			HttpStatus.BAD_GATEWAY
+			HttpStatus.BAD_GATEWAY,
+			kind,
+			code
 		);
 	}
 
-	const payload = (await response
-		.json()
-		.catch(() => ({}))) as CustodianErrorBody & Record<string, unknown>;
+	// Responses are signed by the custodian, bound to our nonce; an unsigned
+	// or wrongly signed response is not trusted, and is ambiguous for a sign.
+	// The body can be lost after the status line arrived (a connection dropped
+	// mid-answer, or the timeout firing while it is read). The custodian may have
+	// signed: that is an ambiguous outcome, never a bare AbortError (which the
+	// renewal path turned into a 500 the client would not retry; measured on the
+	// stand 2026-10-26).
+	let raw: Buffer;
+	try {
+		raw = Buffer.from(await response.arrayBuffer());
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		logger.error(
+			`CA custodian answer for ${method} ${pathSegment} was cut off: ${message} [ambiguous]`
+		);
+		throw new CustodianHttpException(
+			"CA custodian answer was cut off",
+			HttpStatus.BAD_GATEWAY,
+			"ambiguous"
+		);
+	}
+	const respSig = response.headers.get("x-custodian-response-signature");
+	const expected =
+		"sha256=" + mac(`v2r\n${response.status}\n${nonce}\n${sha256Hex(raw)}`);
+	if (
+		!respSig ||
+		respSig.length !== expected.length ||
+		!crypto.timingSafeEqual(Buffer.from(respSig), Buffer.from(expected))
+	) {
+		logger.error(
+			`CA custodian response for ${method} ${pathSegment} is not authenticated`
+		);
+		throw new CustodianHttpException(
+			"CA custodian response could not be authenticated",
+			HttpStatus.BAD_GATEWAY,
+			"ambiguous",
+			"response_unauthenticated"
+		);
+	}
+	let payload: CustodianErrorBody & Record<string, unknown> = {};
+	try {
+		payload = raw.length ? JSON.parse(raw.toString("utf8")) : {};
+	} catch {
+		payload = {};
+	}
 
 	if (!response.ok) {
-		if (response.status === 404) {
-			throw new HttpException(
-				payload.message ?? "Not found",
-				HttpStatus.NOT_FOUND
-			);
-		}
-		if (response.status === 409) {
-			throw new HttpException(
-				payload.message ?? "Conflict",
-				HttpStatus.CONFLICT
-			);
-		}
-		if (response.status === 400) {
-			throw new HttpException(
-				payload.message ?? "Bad request",
-				HttpStatus.BAD_REQUEST
+		const code =
+			typeof payload.error === "string" ? payload.error : undefined;
+		const mayHaveIssued = payload.mayHaveIssued === true;
+		if (response.status >= 400 && response.status < 500 && !mayHaveIssued) {
+			const status =
+				response.status === 404
+					? HttpStatus.NOT_FOUND
+					: response.status === 409
+						? HttpStatus.CONFLICT
+						: response.status === 403
+							? HttpStatus.FORBIDDEN
+							: HttpStatus.BAD_REQUEST;
+			throw new CustodianHttpException(
+				payload.message ?? "CA custodian refused the request",
+				status,
+				"refused",
+				code,
+				payload
 			);
 		}
 		logger.error(
 			`CA custodian returned ${response.status} for ${method} ${pathSegment}: ${payload.error ?? "unknown"} – ${payload.message ?? ""}`
 		);
-		throw new HttpException(
+		throw new CustodianHttpException(
 			"CA custodian request failed",
-			HttpStatus.BAD_GATEWAY
+			HttpStatus.BAD_GATEWAY,
+			"ambiguous",
+			code
 		);
 	}
 
@@ -119,13 +215,81 @@ export interface CustodianSignResult {
 	expiresAt: string;
 }
 
+export interface SignOptions {
+	profile?: "client-30d" | "demo-120s";
+	renewsSerial?: string;
+	idempotencyKey?: string;
+}
+
 export async function signCsrViaCustodian(
 	logger: Logger,
-	csrPem: string
-): Promise<CustodianSignResult> {
-	return custodianRequest<CustodianSignResult>(logger, "POST", "/sign", {
+	csrPem: string,
+	options: SignOptions = {}
+): Promise<
+	CustodianSignResult & {
+		replay?: boolean;
+		lineageId?: string;
+		notBefore?: string;
+	}
+> {
+	return custodianRequest(logger, "POST", "/sign", {
 		csrPem,
+		...options,
 	});
+}
+
+/**
+ * The custodian's record for one idempotency key. Runs inline after an
+ * ambiguous sign (15 s), so it gets a short timeout of its own: 15 + 5 s stays
+ * well inside the gateway's 30 s proxy_read_timeout. With 15 s here the API
+ * could answer at the same second nginx gives up, and a certificate committed
+ * then would reach nobody (measured on the stand 2026-10-25, T3).
+ */
+export async function fetchSignResultViaCustodian(
+	logger: Logger,
+	idempotencyKey: string,
+	timeoutMs = 5_000
+): Promise<
+	{
+		state: "none" | "intent_without_certificate" | "issued";
+	} & Partial<CustodianSignResult>
+> {
+	return custodianRequest(
+		logger,
+		"GET",
+		`/sign-result/${encodeURIComponent(idempotencyKey)}`,
+		undefined,
+		timeoutMs
+	);
+}
+
+export interface LineageRecord {
+	serial: string;
+	lineageId: string;
+	bootstrapAt: number;
+	profile: string;
+	predecessor: string | null;
+	successor?: string;
+	frozen?: boolean;
+	capAt: string;
+}
+
+export async function fetchLineageViaCustodian(
+	logger: Logger,
+	serial: string
+): Promise<LineageRecord> {
+	return custodianRequest(
+		logger,
+		"GET",
+		`/lineage/${encodeURIComponent(serial)}`
+	);
+}
+
+export async function freezeLineageViaCustodian(
+	logger: Logger,
+	serialNumber: string
+): Promise<void> {
+	await custodianRequest(logger, "POST", "/lineage/freeze", { serialNumber });
 }
 
 export async function revokeViaCustodian(

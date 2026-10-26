@@ -107,4 +107,43 @@ describe("HttpExceptionFilter", () => {
 		const call = jsonMock.mock.calls[0][0];
 		expect(call.error.message).not.toContain("something broke internally");
 	});
+
+	it("passes our own snake_case reason and retryAfterSeconds through in details", () => {
+		const host = makeHost("POST", "/api/renew");
+		const response = host.switchToHttp().getResponse() as any;
+		filter.catch(
+			new HttpException(
+				{
+					error: "too_early",
+					message: "Renewal opens later",
+					retryAfterSeconds: 12,
+				},
+				HttpStatus.CONFLICT
+			),
+			host
+		);
+		const jsonMock = response.status.mock.results[0].value.json;
+		expect(jsonMock).toHaveBeenCalledWith(
+			expect.objectContaining({
+				error: expect.objectContaining({
+					code: 409,
+					details: { reason: "too_early", retryAfterSeconds: 12 },
+				}),
+			})
+		);
+	});
+
+	it("does not pass Nest's default error labels as a reason", () => {
+		const host = makeHost();
+		const response = host.switchToHttp().getResponse() as any;
+		filter.catch(
+			new HttpException(
+				{ error: "Not Found", message: "x" },
+				HttpStatus.NOT_FOUND
+			),
+			host
+		);
+		const jsonMock = response.status.mock.results[0].value.json;
+		expect(jsonMock.mock.calls[0][0].error.details).toBeUndefined();
+	});
 });

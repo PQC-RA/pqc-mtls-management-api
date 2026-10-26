@@ -124,7 +124,8 @@ describe("CertsController", () => {
 		expect(result.allowedCn).toBe("my-service");
 		expect(certsService.createEnrollmentToken).toHaveBeenCalledWith(
 			3600,
-			"my-service"
+			"my-service",
+			undefined
 		);
 	});
 

@@ -15,6 +15,7 @@ import { HealthModule } from "@/health/health.module";
 import { IdentityModule } from "@/identity/identity.module";
 import { MonitoringModule } from "@/monitoring/monitoring.module";
 import { PolicyModule } from "@/policy/policy.module";
+import { RenewModule } from "@/renew/renew.module";
 
 @Module({
 	imports: [
@@ -28,6 +29,7 @@ import { PolicyModule } from "@/policy/policy.module";
 		AdminAuditModule,
 		IdentityModule,
 		CertLookupModule,
+		RenewModule,
 	],
 	providers: [
 		// Global guards run in registration order. The chain is:

@@ -5,7 +5,14 @@ import * as os from "os";
 import * as path from "path";
 import { promisify } from "util";
 
-import { HttpException, HttpStatus, Injectable, Logger } from "@nestjs/common";
+import {
+	HttpException,
+	HttpStatus,
+	Injectable,
+	Logger,
+	OnModuleDestroy,
+	OnModuleInit,
+} from "@nestjs/common";
 
 import { AdminAuditService } from "@/admin-audit/admin-audit.service";
 import { tokenId } from "@/admin-audit/sanitize.util";
@@ -18,8 +25,10 @@ import { CertEntry, IndexParserService } from "@/certs/index-parser.service";
 import { TokenStoreService } from "@/certs/token-store.service";
 import { normalizeFingerprint } from "@/common/auth/cert-roles";
 import {
+	CustodianHttpException,
 	fetchIndexViaCustodian,
 	fetchIssuedPemViaCustodian,
+	fetchSignResultViaCustodian,
 	revokeViaCustodian,
 	signCsrViaCustodian,
 } from "@/common/ca-custodian.util";
@@ -44,7 +53,7 @@ const execFileAsync = promisify(execFile);
 const ALLOWED_CSR_KEY_ALGORITHM = "ML-DSA-65";
 
 @Injectable()
-export class CertsService {
+export class CertsService implements OnModuleInit, OnModuleDestroy {
 	private readonly logger = new Logger(CertsService.name);
 	// Used only for parsing/verifying the client-supplied CSR itself (never CA
 	// material) – see verifyCsr/extractCsrCn/readCsrKeyAlgorithm below. All CA
@@ -69,13 +78,24 @@ export class CertsService {
 	 */
 	async createEnrollmentToken(
 		ttlSeconds = 86_400,
-		allowedCn: string
+		allowedCn: string,
+		profile?: "client-30d" | "demo-120s"
 	): Promise<string> {
+		if (profile && process.env.RENEWAL_ENABLED !== "1") {
+			throw new HttpException(
+				"Renewal profiles are disabled on this deployment",
+				HttpStatus.BAD_REQUEST
+			);
+		}
 		const token = "enroll_" + crypto.randomBytes(18).toString("hex");
 		const expiresAt = Date.now() + ttlSeconds * 1000;
-		await this.tokenStore.set(token, { expiresAt, allowedCn });
+		await this.tokenStore.set(token, {
+			expiresAt,
+			allowedCn,
+			...(profile ? { profile } : {}),
+		});
 		this.logger.log(
-			`Created enrollment token (ttl=${ttlSeconds}s, allowedCn=${allowedCn})`
+			`Created enrollment token (ttl=${ttlSeconds}s, allowedCn=${allowedCn}, profile=${profile ?? "legacy"})`
 		);
 		return token;
 	}
@@ -101,34 +121,326 @@ export class CertsService {
 		}
 	}
 
-	private async consumeEnrollmentToken(
-		token: string,
-		cn: string
-	): Promise<void> {
-		const result = await this.tokenStore.consume(token, cn);
+	/** Lease on a reservation: well above the 15 s custodian timeout (R2). */
+	private static readonly LEASE_MS = 60_000;
+	private reconcileTimer?: NodeJS.Timeout;
+
+	onModuleInit(): void {
+		// Periodic reconcile of reservations whose lease passed (R6): never an
+		// implicit release, always a lookup with the custodian first.
+		this.reconcileTimer = setInterval(() => {
+			void this.reconcileStaleReservations().catch(err =>
+				this.logger.error(
+					`Reconcile pass failed: ${(err as Error).message}`
+				)
+			);
+		}, 30_000);
+		this.reconcileTimer.unref();
+	}
+
+	onModuleDestroy(): void {
+		if (this.reconcileTimer) clearInterval(this.reconcileTimer);
+	}
+
+	/**
+	 * Token failures carry a snake_case reason (error.details.reason, through
+	 * the exception filter) beside the human message, as /renew does, so a
+	 * client can tell "retry shortly" (in_progress) from "get a new token".
+	 */
+	private tokenFailure(result: string): HttpException {
+		const fail = (status: HttpStatus, reason: string, message: string) =>
+			new HttpException(
+				{ statusCode: status, error: reason, message },
+				status
+			);
 		switch (result) {
-			case "ok":
-				return;
-			case "not_found":
-				throw new HttpException(
-					"Invalid or already-used enrollment token",
-					HttpStatus.FORBIDDEN
-				);
 			case "expired":
-				throw new HttpException(
-					"Enrollment token has expired",
-					HttpStatus.FORBIDDEN
+				return fail(
+					HttpStatus.FORBIDDEN,
+					"token_expired",
+					"Enrollment token has expired"
 				);
 			case "already_used":
-				throw new HttpException(
-					"Enrollment token has already been used",
-					HttpStatus.FORBIDDEN
+				return fail(
+					HttpStatus.FORBIDDEN,
+					"token_already_used",
+					"Enrollment token has already been used"
 				);
 			case "cn_mismatch":
-				throw new HttpException(
-					"CSR subject CN does not match the CN constraint on this enrollment token",
-					HttpStatus.FORBIDDEN
+				return fail(
+					HttpStatus.FORBIDDEN,
+					"cn_mismatch",
+					"CSR subject CN does not match the CN constraint on this enrollment token"
 				);
+			case "in_progress":
+				return fail(
+					HttpStatus.CONFLICT,
+					"in_progress",
+					"An enrollment with this token is in progress; retry shortly"
+				);
+			default:
+				return fail(
+					HttpStatus.FORBIDDEN,
+					"token_invalid",
+					"Invalid or already-used enrollment token"
+				);
+		}
+	}
+
+	/** SHA-256 of the SubjectPublicKeyInfo (DER) of a CSR file. */
+	private async spkiSha256OfCsrFile(csrPath: string): Promise<string> {
+		const { stdout } = await execFileAsync(this.openssl, [
+			"req",
+			"-in",
+			csrPath,
+			"-noout",
+			"-pubkey",
+		]);
+		const der = crypto
+			.createPublicKey(stdout)
+			.export({ type: "spki", format: "der" }) as Buffer;
+		return crypto.createHash("sha256").update(der).digest("hex");
+	}
+
+	private async auditReplay(
+		token: string,
+		cn: string,
+		r: { certificate: string; serialNumber: string; expiresAt: string },
+		source?: string
+	): Promise<{
+		certificate: string;
+		serialNumber: string;
+		expiresAt: string;
+		replay: true;
+	}> {
+		this.logger.log(
+			`Enrollment replay: serial=${r.serialNumber} cn=${cn} (same key, response had been lost)`
+		);
+		await this.adminAudit.append({
+			action: "cert.enroll.replay",
+			actor: null,
+			target: `cn=${cn} serial=${r.serialNumber}`,
+			params: { cn, tokenId: tokenId(token), source },
+			result: { status: "ok", httpStatus: HttpStatus.CREATED },
+		});
+		return { ...r, replay: true };
+	}
+
+	/** A used token tried with another key or CN: the stolen-token signal, audited apart. */
+	private async auditKeyMismatch(
+		token: string,
+		cn: string,
+		why: string,
+		source?: string
+	): Promise<void> {
+		this.logger.warn(
+			`Enrollment with a used token and a different ${why === "cn" ? "CN" : "key"}: cn=${cn}`
+		);
+		await this.adminAudit.append({
+			action: "token.replay_mismatch",
+			actor: null,
+			target: `cn=${cn}`,
+			params: {
+				cn,
+				tokenId: tokenId(token),
+				reason: `replay_${why}_mismatch`,
+				source,
+			},
+			result: { status: "error", httpStatus: HttpStatus.FORBIDDEN },
+		});
+	}
+
+	/**
+	 * Enrollment replay (requirement R5, measured 2026-10-25): when the token
+	 * was committed to a certificate whose public key is the key of THIS CSR,
+	 * the client lost the response (gateway timeout, a killed API, a reconcile
+	 * after the lease) and retries with the same key. The CSR's self-signature
+	 * was verified, so the caller holds that key: give the certificate back
+	 * instead of "already used", which would need an admin.
+	 *
+	 *   replay                the certificate, still valid and not revoked
+	 *   mismatch              another key or CN: the caller gets "already used"
+	 *   none                  nothing committed to compare with
+	 *   throws 503 replay_unavailable  the custodian could not be asked; retry
+	 *   throws 403 certificate_revoked / certificate_expired  it is dead; a new
+	 *                         bootstrap is needed (after an admin revokes, if so)
+	 */
+	private async replayIfSameKey(
+		csrPath: string,
+		cn: string,
+		serial: string | undefined,
+		certificate?: string
+	): Promise<
+		| {
+				kind: "replay";
+				r: {
+					certificate: string;
+					serialNumber: string;
+					expiresAt: string;
+				};
+		  }
+		| { kind: "mismatch"; why: string }
+		| { kind: "none" }
+	> {
+		if (!serial && !certificate) return { kind: "none" };
+		const unavailable = (why: string) => {
+			this.logger.warn(
+				`Enrollment replay unavailable for serial ${serial ?? "?"}: ${why}`
+			);
+			return new HttpException(
+				{
+					statusCode: HttpStatus.SERVICE_UNAVAILABLE,
+					error: "replay_unavailable",
+					message:
+						"The issued certificate cannot be looked up right now; retry with the same key",
+					retryAfterSeconds: 30,
+				},
+				HttpStatus.SERVICE_UNAVAILABLE
+			);
+		};
+		let pem = certificate;
+		if (!pem && serial) {
+			try {
+				pem = await fetchIssuedPemViaCustodian(this.logger, serial);
+			} catch (err) {
+				throw unavailable((err as Error).message);
+			}
+		}
+		if (!pem) return { kind: "none" };
+		let x: crypto.X509Certificate;
+		try {
+			const block = pem.match(
+				/-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/
+			);
+			if (!block)
+				return { kind: "mismatch", why: "no certificate block" };
+			x = new crypto.X509Certificate(block[0]);
+			const issued = crypto
+				.createHash("sha256")
+				.update(
+					x.publicKey.export({
+						type: "spki",
+						format: "der",
+					}) as Buffer
+				)
+				.digest("hex");
+			const asked = await this.spkiSha256OfCsrFile(csrPath);
+			if (issued !== asked) return { kind: "mismatch", why: "key" };
+			const subjectCn = x.subject
+				.split("\n")
+				.find(l => l.startsWith("CN="))
+				?.slice(3);
+			if (subjectCn !== cn) return { kind: "mismatch", why: "cn" };
+		} catch (err) {
+			// Anything unreadable is not a replay: the caller answers "already used".
+			this.logger.warn(
+				`Enrollment replay check failed: ${(err as Error).message}`
+			);
+			return { kind: "mismatch", why: "unreadable" };
+		}
+		const ser = (serial ?? x.serialNumber).toUpperCase();
+		const dead = (reason: string, message: string) =>
+			new HttpException(
+				{ statusCode: HttpStatus.FORBIDDEN, error: reason, message },
+				HttpStatus.FORBIDDEN
+			);
+		if (Date.parse(x.validTo) <= Date.now())
+			throw dead(
+				"certificate_expired",
+				"The certificate issued under this token has expired; a new bootstrap enrollment is required"
+			);
+		let index: string;
+		try {
+			index = await fetchIndexViaCustodian(this.logger);
+		} catch (err) {
+			throw unavailable((err as Error).message);
+		}
+		const row = index
+			.split("\n")
+			.map(l => l.split("\t"))
+			.find(f => f.length > 3 && f[3].toUpperCase() === ser);
+		if (row && row[0] !== "V")
+			throw dead(
+				"certificate_revoked",
+				"The certificate issued under this token is revoked; a new bootstrap enrollment is required"
+			);
+		return {
+			kind: "replay",
+			r: {
+				certificate: pem,
+				serialNumber: ser,
+				expiresAt: new Date(x.validTo).toISOString(),
+			},
+		};
+	}
+
+	/**
+	 * Settle one reservation from the custodian's record: commit if a
+	 * certificate exists for it, release if the custodian has none. Returns the
+	 * issued result when committed. Leaves the reservation alone when the
+	 * custodian cannot be asked.
+	 */
+	private async reconcileReservation(
+		token: string,
+		reservationId: string,
+		cn?: string
+	): Promise<{
+		certificate: string;
+		serialNumber: string;
+		expiresAt: string;
+	} | null> {
+		const r = await fetchSignResultViaCustodian(
+			this.logger,
+			`enroll:${reservationId}`
+		);
+		if (r.state === "issued" && r.serialNumber && r.certificate) {
+			await this.tokenStore.commit(token, reservationId, r.serialNumber);
+			await this.adminAudit.append({
+				action: "token.commit",
+				actor: null,
+				target: `serial=${r.serialNumber}`,
+				params: {
+					tokenId: tokenId(token),
+					reservationId,
+					via: "reconcile",
+					...(cn ? { cn } : {}),
+				},
+				result: { status: "ok", httpStatus: HttpStatus.OK },
+			});
+			return {
+				certificate: r.certificate,
+				serialNumber: r.serialNumber,
+				expiresAt: r.expiresAt ?? "",
+			};
+		}
+		await this.tokenStore.release(token, reservationId);
+		await this.adminAudit.append({
+			action: "token.release",
+			actor: null,
+			target: cn ? `cn=${cn}` : null,
+			params: {
+				tokenId: tokenId(token),
+				reservationId,
+				reason: `reconcile:${r.state}`,
+			},
+			result: { status: "ok", httpStatus: HttpStatus.OK },
+		});
+		return null;
+	}
+
+	async reconcileStaleReservations(): Promise<void> {
+		for (const s of await this.tokenStore.staleReservations()) {
+			try {
+				await this.reconcileReservation(
+					s.token,
+					s.reservationId,
+					s.meta.allowedCn
+				);
+			} catch (err) {
+				this.logger.warn(
+					`Reconcile of reservation ${s.reservationId} deferred: ${(err as Error).message}`
+				);
+			}
 		}
 	}
 
@@ -352,28 +664,170 @@ export class CertsService {
 			// 3. Extract CN from CSR subject for token constraint check
 			csrCn = await this.extractCsrCn(csrPath);
 
-			// 4. Consume enrollment token – atomically verifies CN constraint, TTL, and single-use
-			await this.consumeEnrollmentToken(enrollmentToken, csrCn);
+			// 4. Reserve the enrollment token (item 4): CN, TTL and single-use
+			//    are checked atomically, but the token is only marked used once a
+			//    certificate exists (commit). A definite failure releases it; an
+			//    ambiguous one is reconciled with the custodian first.
+			let reservationId = crypto.randomUUID();
+			let reserved = await this.tokenStore.reserve(
+				enrollmentToken,
+				csrCn,
+				reservationId,
+				CertsService.LEASE_MS
+			);
+			if (reserved.result === "stale_reservation") {
+				const settled = await this.reconcileReservation(
+					enrollmentToken,
+					reserved.reservationId,
+					csrCn
+				);
+				if (settled) {
+					const replay = await this.replayIfSameKey(
+						csrPath,
+						csrCn,
+						settled.serialNumber,
+						settled.certificate
+					);
+					if (replay.kind === "replay")
+						return await this.auditReplay(
+							enrollmentToken,
+							csrCn,
+							replay.r,
+							source
+						);
+					if (replay.kind === "mismatch")
+						await this.auditKeyMismatch(
+							enrollmentToken,
+							csrCn,
+							replay.why,
+							source
+						);
+					throw this.tokenFailure("already_used");
+				}
+				reservationId = crypto.randomUUID();
+				reserved = await this.tokenStore.reserve(
+					enrollmentToken,
+					csrCn,
+					reservationId,
+					CertsService.LEASE_MS
+				);
+			}
+			if (reserved.result === "already_used") {
+				const replay = await this.replayIfSameKey(
+					csrPath,
+					csrCn,
+					reserved.serial
+				);
+				if (replay.kind === "replay")
+					return await this.auditReplay(
+						enrollmentToken,
+						csrCn,
+						replay.r,
+						source
+					);
+				if (replay.kind === "mismatch")
+					await this.auditKeyMismatch(
+						enrollmentToken,
+						csrCn,
+						replay.why,
+						source
+					);
+			}
+			if (reserved.result !== "ok")
+				throw this.tokenFailure(reserved.result);
+			const profile = reserved.meta.profile;
+			await this.adminAudit.append({
+				action: "token.reserve",
+				actor: null,
+				target: `cn=${csrCn}`,
+				params: {
+					tokenId: tokenId(enrollmentToken),
+					reservationId,
+					profile: profile ?? "legacy",
+				},
+				result: { status: "ok", httpStatus: HttpStatus.OK },
+			});
 
 			// 5. Sign with the intermediate CA – the ONLY component that touches
 			//    the private key is the pqc-ca-custodian sidecar.
-			const {
-				certificate: certPem,
-				serialNumber,
-				expiresAt,
-			} = await signCsrViaCustodian(this.logger, csrPem);
+			let signed: {
+				certificate: string;
+				serialNumber: string;
+				expiresAt: string;
+			};
+			try {
+				signed = await signCsrViaCustodian(this.logger, csrPem, {
+					idempotencyKey: `enroll:${reservationId}`,
+					...(profile ? { profile } : {}),
+				});
+			} catch (err) {
+				const kind =
+					err instanceof CustodianHttpException
+						? err.kind
+						: "ambiguous";
+				if (kind === "ambiguous") {
+					let settled: {
+						certificate: string;
+						serialNumber: string;
+						expiresAt: string;
+					} | null = null;
+					try {
+						settled = await this.reconcileReservation(
+							enrollmentToken,
+							reservationId,
+							csrCn
+						);
+					} catch (e) {
+						this.logger.warn(
+							`Reservation ${reservationId} left for the periodic reconcile: ${(e as Error).message}`
+						);
+						throw err;
+					}
+					if (!settled) throw err;
+					signed = settled;
+				} else {
+					await this.tokenStore.release(
+						enrollmentToken,
+						reservationId
+					);
+					await this.adminAudit.append({
+						action: "token.release",
+						actor: null,
+						target: `cn=${csrCn}`,
+						params: {
+							tokenId: tokenId(enrollmentToken),
+							reservationId,
+							reason: kind,
+						},
+						result: { status: "ok", httpStatus: HttpStatus.OK },
+					});
+					throw err;
+				}
+			}
+			const { certificate: certPem, serialNumber, expiresAt } = signed;
+			const commit = await this.tokenStore.commit(
+				enrollmentToken,
+				reservationId,
+				serialNumber
+			);
+			if (commit !== "ok")
+				this.logger.warn(
+					`Commit of reservation ${reservationId} returned ${commit}`
+				);
 
 			this.logger.log(
 				`Certificate signed: serial=${serialNumber}, expires=${expiresAt}`
 			);
 
-			void this.adminAudit.append({
+			await this.adminAudit.append({
 				action: "cert.enroll",
 				actor: null, // public, token-authorized enrollment – no admin identity
 				target: `cn=${csrCn} serial=${serialNumber}`,
 				params: {
 					cn: csrCn,
 					tokenId: tokenId(enrollmentToken),
+					reservationId,
+					profile: profile ?? "legacy",
 					source,
 				},
 				result: { status: "ok", httpStatus: HttpStatus.CREATED },
@@ -387,7 +841,7 @@ export class CertsService {
 			const httpStatus = isKnownHttpException
 				? (error as HttpException).getStatus()
 				: HttpStatus.INTERNAL_SERVER_ERROR;
-			void this.adminAudit.append({
+			await this.adminAudit.append({
 				action: "cert.enroll",
 				actor: null,
 				target: csrCn ? `cn=${csrCn}` : null,
@@ -477,6 +931,16 @@ export class CertsService {
 				/* best-effort cleanup */
 			}
 		}
+	}
+
+	/**
+	 * The issuance checks renewal shares with enrollment: CSR self-signature and
+	 * ML-DSA-65 key (both required enforcement points), then the CN.
+	 */
+	async checkCsrForIssuance(csrPath: string): Promise<string> {
+		await this.verifyCsr(csrPath);
+		await this.assertCsrKeyAlgorithmAllowed(csrPath);
+		return this.extractCsrCn(csrPath);
 	}
 
 	private async extractCsrCn(csrPath: string): Promise<string> {

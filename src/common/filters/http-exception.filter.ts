@@ -28,6 +28,10 @@ export class HttpExceptionFilter implements ExceptionFilter {
 
 		let status = HttpStatus.INTERNAL_SERVER_ERROR;
 		let message = "An unexpected error occurred";
+		// A machine-readable reason a client can act on (renewal: too_early,
+		// renewal_conflict, not_renewable, ...). Only snake_case codes set by our
+		// own services pass; Nest's default "Not Found"-style labels do not.
+		let details: { reason: string; retryAfterSeconds?: number } | undefined;
 
 		if (exception instanceof HttpException) {
 			status = exception.getStatus();
@@ -46,6 +50,20 @@ export class HttpExceptionFilter implements ExceptionFilter {
 				// ValidationPipe returns message as string[]
 				message = Array.isArray(raw) ? raw.join("; ") : String(raw);
 			}
+			if (typeof res === "object" && res !== null) {
+				const { error, retryAfterSeconds } = res as {
+					error?: unknown;
+					retryAfterSeconds?: unknown;
+				};
+				if (
+					typeof error === "string" &&
+					/^[a-z][a-z_]{1,39}$/.test(error)
+				) {
+					details = { reason: error };
+					if (typeof retryAfterSeconds === "number")
+						details.retryAfterSeconds = retryAfterSeconds;
+				}
+			}
 		} else if (exception instanceof Error) {
 			// Unhandled errors – log full detail, return generic message
 			this.logger.error(
@@ -54,6 +72,6 @@ export class HttpExceptionFilter implements ExceptionFilter {
 			);
 		}
 
-		response.status(status).json(errorResponse(status, message));
+		response.status(status).json(errorResponse(status, message, details));
 	}
 }
