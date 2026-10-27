@@ -41,10 +41,9 @@ RUN pnpm config set ignore-scripts true && pnpm install --frozen-lockfile
 
 COPY . ./
 
-RUN pnpm build
-# Only production dependencies go into the runtime image: dev tooling (test
-# runners, linters, templating) is not shipped.
-RUN pnpm prune --prod --ignore-scripts
+# Build, then keep only production dependencies for the runtime image: dev
+# tooling (test runners, linters, templating) is not shipped.
+RUN pnpm build && pnpm prune --prod --ignore-scripts
 
 # Runtime stage – ubuntu:24.04 provides glibc 2.39 required by PQ OpenSSL build
 FROM ubuntu:24.04@sha256:24737cef17f4e22b1977df7d9a05e77c4e28b7da5b8911f8d8ccda136bf3573c
