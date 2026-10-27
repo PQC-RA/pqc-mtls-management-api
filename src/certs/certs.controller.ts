@@ -204,6 +204,9 @@ export class CertsController {
 	}
 
 	@Get("enrollment-tokens")
+	// Admin only: the list carries the bearer values themselves, and a token in
+	// anyone else's hands enrolls as its CN before the intended client does.
+	@Roles("admin")
 	@ApiGet({
 		summary: "List outstanding enrollment tokens",
 		description:

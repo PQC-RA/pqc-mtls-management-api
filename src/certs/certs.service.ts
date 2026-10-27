@@ -35,6 +35,8 @@ import {
 import { PKI_CONFIG } from "@/common/config/pki.config";
 import { triggerCrlRegeneration } from "@/common/crl-signal.util";
 
+import { singleCommonName, SubjectDnError } from "../common/subject-dn.util";
+
 const execFileAsync = promisify(execFile);
 
 /**
@@ -944,23 +946,29 @@ export class CertsService implements OnModuleInit, OnModuleDestroy {
 	}
 
 	private async extractCsrCn(csrPath: string): Promise<string> {
+		// RFC 2253 is the form the custodian and the gateway read; exactly one CN
+		// and no multi-valued RDN, so all three components agree on the identity
+		// (subject-dn.util.ts).
 		const { stdout } = await execFileAsync(this.openssl, [
 			"req",
 			"-in",
 			csrPath,
 			"-noout",
 			"-subject",
+			"-nameopt",
+			"RFC2253",
 		]);
-		// Modern OpenSSL: "subject=C = BG, O = ACME Corp, CN = my-service"
-		// Legacy OpenSSL: "subject= /C=BG/O=ACME/CN=my-service"
-		const m = stdout.match(/\bCN\s*=\s*([^,\/\n]+)/);
-		if (!m) {
-			throw new HttpException(
-				"CSR subject does not contain a CN (Common Name) field",
-				HttpStatus.BAD_REQUEST
-			);
+		try {
+			return singleCommonName(stdout.split("\n")[0]);
+		} catch (e) {
+			if (e instanceof SubjectDnError) {
+				throw new HttpException(
+					`CSR subject refused: ${e.message} (exactly one CN, one attribute per RDN)`,
+					HttpStatus.BAD_REQUEST
+				);
+			}
+			throw e;
 		}
-		return m[1].trim();
 	}
 
 	private async verifyCsr(csrPath: string): Promise<void> {

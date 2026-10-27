@@ -21,7 +21,9 @@ const { privateKey, publicKey } = generateKeyPairSync("rsa", {
 	privateKeyEncoding: { type: "pkcs8", format: "pem" },
 });
 
-const TEST_KID = "gw-rs256-v1";
+const TEST_KID = "admin-v1";
+// Another key the gateway's JWKS really serves (the backend token's).
+const OTHER_KID = "backend-v1";
 // SHA-256 certificate fingerprint = 64 lowercase hex chars (what the gateway
 // emits as SHA-256(DER) and what ADMIN_CERT_FINGERPRINTS must contain).
 const TEST_FPR =
@@ -76,7 +78,7 @@ function makeContext(authHeader?: string): ExecutionContext {
 jest.mock("jwks-rsa", () => {
 	return jest.fn().mockReturnValue({
 		getSigningKey: jest.fn().mockImplementation((kid: string) => {
-			if (kid !== TEST_KID) {
+			if (kid !== TEST_KID && kid !== OTHER_KID) {
 				return Promise.reject(new Error("Key not found"));
 			}
 			return Promise.resolve({ getPublicKey: () => publicKey });
@@ -153,6 +155,13 @@ describe("JwtAuthGuard", () => {
 		const ctx = makeContext(`Bearer ${makeToken({ kid: "unknown-kid" })}`);
 		await expect(guard.canActivate(ctx)).rejects.toThrow(
 			UnauthorizedException
+		);
+	});
+
+	it("refuses a valid signature by another JWKS key (kid pinned to the admin key)", async () => {
+		const ctx = makeContext(`Bearer ${makeToken({ kid: OTHER_KID })}`);
+		await expect(guard.canActivate(ctx)).rejects.toThrow(
+			"Token not signed with the admin key"
 		);
 	});
 
