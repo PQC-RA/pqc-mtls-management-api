@@ -49,6 +49,12 @@ export function singleCommonName(rfc2253: string): string {
 		.replace(/^\s*subject\s*=\s*/i, "")
 		.replace(/[\r\n]+$/, "");
 	if (!s.trim()) throw new SubjectDnError("empty subject");
+	// Exactly one "CN=" anywhere in the subject: a regular expression reading the
+	// DN must find only the CN attribute (an attribute type such as ISO-CN, OID
+	// 1.2.156, prints as "ISO-CN=victim").
+	if ((s.match(/cn\s*=/gi) ?? []).length > 1) {
+		throw new SubjectDnError('"CN=" occurs more than once in the subject');
+	}
 	const cns: string[] = [];
 	for (const rdn of splitUnescaped(s, ",")) {
 		const attrs = splitUnescaped(rdn, "+");

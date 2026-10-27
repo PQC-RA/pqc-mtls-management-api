@@ -7,32 +7,36 @@ describe("singleCommonName (RFC 2253 subject, strict)", () => {
 		);
 		expect(singleCommonName("C=BG,O=ACME,CN=svc.b_2")).toBe("svc.b_2");
 	});
-	it("accepts other attributes with RFC 2253 escapes", () => {
+	it("accepts other attributes with RFC 2253 escapes and spaces", () => {
 		expect(singleCommonName("CN=svc,O=ACME\\, Inc.,C=BG")).toBe("svc");
-		expect(singleCommonName("CN=svc,OU=R\\+D")).toBe("svc");
+		expect(singleCommonName("CN=svc,OU=R\\+D,O=ACME Corp")).toBe("svc");
 	});
 	it("refuses two CN attributes (the token-binding bypass)", () => {
 		expect(() => singleCommonName("CN=victim,CN=allowed")).toThrow(
 			SubjectDnError
 		);
 		expect(() => singleCommonName("CN=victim,O=X,CN=allowed")).toThrow(
-			/more than one CN/
+			SubjectDnError
 		);
 	});
-	it("refuses a value that a regular expression could read as a CN", () => {
+	it("refuses anything a regular expression could read as a CN", () => {
 		expect(() =>
 			singleCommonName("emailAddress=xCN=victim,CN=allowed")
-		).toThrow(/CN=/);
+		).toThrow(SubjectDnError);
 		expect(() => singleCommonName("OU=xcn=victim,CN=allowed")).toThrow(
-			/CN=/
+			SubjectDnError
 		);
 		expect(() => singleCommonName("CN=allowed,O=a/CN=victim")).toThrow(
 			SubjectDnError
 		);
+		// ISO-CN (OID 1.2.156) prints as "ISO-CN=victim"
+		expect(() => singleCommonName("ISO-CN=victim,CN=allowed")).toThrow(
+			/more than once/
+		);
 	});
 	it("refuses multi-valued RDNs", () => {
 		expect(() => singleCommonName("CN=allowed+CN=victim")).toThrow(
-			/multi-valued/
+			SubjectDnError
 		);
 		expect(() => singleCommonName("CN=svc,O=A+OU=B")).toThrow(
 			/multi-valued/
