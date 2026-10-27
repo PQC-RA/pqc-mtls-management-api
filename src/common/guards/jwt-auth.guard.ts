@@ -53,7 +53,12 @@ const EXPECTED_ISSUER = process.env.JWT_EXPECTED_ISSUER ?? "pqc-gateway";
 // The admin token's key ID. The gateway's JWKS also holds the backend and lookup
 // keys; without this pin any of them, if leaked, could mint an admin token with
 // the right audience. Change it here (env) when the admin key is rotated.
-const EXPECTED_KID = process.env.JWT_EXPECTED_KID ?? "admin-v1";
+// A comma-separated list, so a rotation can accept the old and the new kid for
+// the minute the change takes on both sides.
+const EXPECTED_KIDS = (process.env.JWT_EXPECTED_KID ?? "admin-v1")
+	.split(",")
+	.map(k => k.trim())
+	.filter(Boolean);
 const EXPECTED_AUDIENCE =
 	process.env.JWT_EXPECTED_AUDIENCE ?? "pqc-mtls-management-api";
 
@@ -119,9 +124,9 @@ export class JwtAuthGuard implements CanActivate {
 			this.logger.warn("Token header missing kid claim");
 			throw new UnauthorizedException("Token missing key ID (kid)");
 		}
-		if (kid !== EXPECTED_KID) {
+		if (!EXPECTED_KIDS.includes(kid)) {
 			this.logger.warn(
-				`Token signed with kid=${kid}, not the admin key ${EXPECTED_KID}`
+				`Token signed with kid=${kid}, not an admin key (${EXPECTED_KIDS.join(",")})`
 			);
 			throw new UnauthorizedException(
 				"Token not signed with the admin key"

@@ -5,12 +5,11 @@ describe("singleCommonName (RFC 2253 subject, strict)", () => {
 		expect(singleCommonName("subject=CN=svc-a,OU=M2M,O=ACME,C=BG")).toBe(
 			"svc-a"
 		);
-		expect(singleCommonName("C=BG,O=ACME,CN=svc-b")).toBe("svc-b");
+		expect(singleCommonName("C=BG,O=ACME,CN=svc.b_2")).toBe("svc.b_2");
 	});
-	it("unescapes RFC 2253 values", () => {
-		expect(singleCommonName("CN=a\\,b,O=ACME")).toBe("a,b");
-		expect(singleCommonName("CN=x\\+y")).toBe("x+y");
-		expect(singleCommonName("CN=caf\\C3\\A9")).toBe("café");
+	it("accepts other attributes with RFC 2253 escapes", () => {
+		expect(singleCommonName("CN=svc,O=ACME\\, Inc.,C=BG")).toBe("svc");
+		expect(singleCommonName("CN=svc,OU=R\\+D")).toBe("svc");
 	});
 	it("refuses two CN attributes (the token-binding bypass)", () => {
 		expect(() => singleCommonName("CN=victim,CN=allowed")).toThrow(
@@ -20,8 +19,14 @@ describe("singleCommonName (RFC 2253 subject, strict)", () => {
 			/more than one CN/
 		);
 	});
-	it("refuses a CN given by OID next to one by name", () => {
-		expect(() => singleCommonName("2.5.4.3=victim,CN=allowed")).toThrow(
+	it("refuses a value that a regular expression could read as a CN", () => {
+		expect(() =>
+			singleCommonName("emailAddress=xCN=victim,CN=allowed")
+		).toThrow(/CN=/);
+		expect(() => singleCommonName("OU=xcn=victim,CN=allowed")).toThrow(
+			/CN=/
+		);
+		expect(() => singleCommonName("CN=allowed,O=a/CN=victim")).toThrow(
 			SubjectDnError
 		);
 	});
@@ -31,6 +36,14 @@ describe("singleCommonName (RFC 2253 subject, strict)", () => {
 		);
 		expect(() => singleCommonName("CN=svc,O=A+OU=B")).toThrow(
 			/multi-valued/
+		);
+	});
+	it("refuses a CN outside the CN alphabet", () => {
+		expect(() => singleCommonName("CN=a\\,b,O=ACME")).toThrow(/outside/);
+		expect(() => singleCommonName("CN=caf\\C3\\A9")).toThrow(/outside/);
+		expect(() => singleCommonName("CN=two words")).toThrow(/outside/);
+		expect(() => singleCommonName("CN=" + "a".repeat(65))).toThrow(
+			/outside/
 		);
 	});
 	it("refuses a subject without CN, an empty CN or an empty subject", () => {

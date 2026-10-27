@@ -5,9 +5,15 @@ import { HttpInstrumentation } from "@opentelemetry/instrumentation-http";
 import { NodeSDK } from "@opentelemetry/sdk-node";
 
 // Automatically initializes OpenTelemetry before the application boots
-// Prometheus metrics are exposed on a separate server at http://localhost:8081/metrics
+// Prometheus metrics are exposed on a separate server at http://<host>:3001/metrics
 const otelSDK = new NodeSDK({
-	metricReaders: [new PrometheusExporter({ port: 3001 })],
+	// host explicit: exporter-prometheus 0.300+ defaults to localhost only.
+	metricReaders: [
+		new PrometheusExporter({
+			host: process.env.METRICS_HOST ?? "0.0.0.0",
+			port: 3001,
+		}),
+	],
 	instrumentations: [
 		getNodeAutoInstrumentations(),
 		new HttpInstrumentation(),

@@ -114,7 +114,7 @@ function startJwksServer(
 
 // ── Test fixtures ────────────────────────────────────────────────────────────
 
-const KEY_ID = "test-pqc-rs256-v1";
+const KEY_ID = "admin-v1";
 const ISSUER = "pqc-gateway";
 const AUDIENCE = "pqc-mtls-management-api";
 const CONSOLE_ORIGIN = "https://console.test";
@@ -379,10 +379,16 @@ describe("POST /api/admin/certs/enrollment-tokens (RBAC + CSRF)", () => {
 });
 
 describe("GET /api/admin/certs/enrollment-tokens", () => {
-	it("auditor may read the token list", async () => {
+	it("auditor may NOT read the token list (it holds bearer values)", async () => {
 		const res = await request(app.getHttpServer())
 			.get("/api/admin/certs/enrollment-tokens")
 			.set("Authorization", `Bearer ${auditorToken}`);
+		expect(res.status).toBe(403);
+	});
+	it("admin reads the token list", async () => {
+		const res = await request(app.getHttpServer())
+			.get("/api/admin/certs/enrollment-tokens")
+			.set("Authorization", `Bearer ${adminToken}`);
 		expect(res.status).toBe(200);
 		expect(Array.isArray(res.body)).toBe(true);
 	});

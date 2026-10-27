@@ -305,7 +305,7 @@ describe("CertsService", () => {
 						stderr: "",
 					});
 				} else if (args.includes("-subject")) {
-					cb(null, { stdout: "subject=CN = test-cn", stderr: "" });
+					cb(null, { stdout: "subject=CN=test-cn", stderr: "" });
 				} else if (args.includes("ca")) {
 					cb(null, { stdout: "", stderr: "" });
 				} else if (args.includes("x509")) {
@@ -839,7 +839,7 @@ describe("CertsService", () => {
 						stderr: "",
 					});
 				else if (args.includes("-subject"))
-					cb(null, { stdout: "subject=CN = my-service", stderr: "" });
+					cb(null, { stdout: "subject=CN=my-service", stderr: "" });
 				else cb(null, { stdout: "", stderr: "" });
 			});
 
@@ -863,7 +863,7 @@ describe("CertsService", () => {
 						stderr: "",
 					});
 				else if (args.includes("-subject"))
-					cb(null, { stdout: "subject=CN = my-service", stderr: "" });
+					cb(null, { stdout: "subject=CN=my-service", stderr: "" });
 				else cb(null, { stdout: "", stderr: "" });
 			});
 

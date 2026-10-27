@@ -1,4 +1,5 @@
 import {
+	BadRequestException,
 	Body,
 	Controller,
 	DefaultValuePipe,
@@ -55,6 +56,8 @@ import {
 import { Public } from "@/common/decorators/public.decorator";
 import { Roles } from "@/common/decorators/roles.decorator";
 import { EnrollHmacGuard } from "@/common/guards/enroll-hmac.guard";
+
+import { CN_PATTERN } from "../common/subject-dn.util";
 
 /**
  * DTO for validating the :serial path parameter.
@@ -194,6 +197,9 @@ export class CertsController {
 			);
 		}
 		const allowedCn = cn.trim();
+		if (!CN_PATTERN.test(allowedCn)) {
+			throw new BadRequestException("cn must match [A-Za-z0-9._-]{1,64}");
+		}
 		const expiresAt = Date.now() + ttl * 1000;
 		const token = await this.certsService.createEnrollmentToken(
 			ttl,

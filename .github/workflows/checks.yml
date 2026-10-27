@@ -55,6 +55,11 @@ jobs:
       - name: Test
         run: pnpm exec jest --ci
 
+      # The end-to-end suite boots the app with its guards; it caught a kid pin
+      # the unit tests did not (2026-10-27).
+      - name: End-to-end tests
+        run: pnpm run test:e2e
+
       - name: Build
         run: pnpm build
 

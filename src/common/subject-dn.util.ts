@@ -4,14 +4,19 @@
  *
  * Why strict: the components of this system read the CN differently. OpenSSL's
  * default print is in forward order, RFC 2253 (the custodian, the gateway's
- * $ssl_client_s_dn) in reverse order, so a subject with two CN attributes
- * ("/CN=allowed/CN=victim") is "allowed" to one and "victim" to the others. A
- * token bound to one CN could then yield a certificate the gateway routes as
- * another. So a subject is accepted only with exactly one CN and no
- * multi-valued RDN, and every component agrees on it.
+ * $ssl_client_s_dn) in reverse order, and the custodian and the gateway find the
+ * CN with a regular expression over the printed DN. So a subject is accepted
+ * only if every reader must agree on its CN:
+ *   - exactly one CN attribute, and one attribute per RDN;
+ *   - the CN within [A-Za-z0-9._-]{1,64};
+ *   - no attribute value containing "CN=" (any case) or "/", which a regular
+ *     expression could take for a CN ("emailAddress=xCN=victim").
  */
 
 export class SubjectDnError extends Error {}
+
+/** The CN alphabet. Every CN issued so far fits it. */
+export const CN_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
 
 /** Split on separators that are not escaped with a backslash. */
 function splitUnescaped(s: string, sep: string): string[] {
@@ -35,35 +40,15 @@ function splitUnescaped(s: string, sep: string): string[] {
 	return out;
 }
 
-/** Undo RFC 2253 escaping: "\," "\+" "\\" ... and "\XX" hex pairs. */
-function unescapeValue(v: string): string {
-	const bytes: number[] = [];
-	for (let i = 0; i < v.length; i++) {
-		const c = v[i];
-		if (c === "\\" && i + 1 < v.length) {
-			const hex = v.slice(i + 1, i + 3);
-			if (/^[0-9A-Fa-f]{2}$/.test(hex)) {
-				bytes.push(parseInt(hex, 16));
-				i += 2;
-				continue;
-			}
-			bytes.push(...Buffer.from(v[i + 1], "utf8"));
-			i++;
-			continue;
-		}
-		bytes.push(...Buffer.from(c, "utf8"));
-	}
-	return Buffer.from(bytes).toString("utf8");
-}
-
 /**
  * The one CN of an RFC 2253 subject ("CN=svc,O=ACME,C=BG", with or without a
- * leading "subject="). Throws SubjectDnError unless the subject has exactly one
- * CN attribute and every RDN has exactly one attribute.
+ * leading "subject="). Throws SubjectDnError otherwise.
  */
 export function singleCommonName(rfc2253: string): string {
-	const s = rfc2253.replace(/^\s*subject\s*=\s*/i, "").trim();
-	if (!s) throw new SubjectDnError("empty subject");
+	const s = rfc2253
+		.replace(/^\s*subject\s*=\s*/i, "")
+		.replace(/[\r\n]+$/, "");
+	if (!s.trim()) throw new SubjectDnError("empty subject");
 	const cns: string[] = [];
 	for (const rdn of splitUnescaped(s, ",")) {
 		const attrs = splitUnescaped(rdn, "+");
@@ -72,10 +57,14 @@ export function singleCommonName(rfc2253: string): string {
 		}
 		const eq = attrs[0].indexOf("=");
 		if (eq < 1) throw new SubjectDnError("malformed RDN in subject");
-		const type = attrs[0].slice(0, eq).trim();
-		if (type.toUpperCase() === "CN" || type === "2.5.4.3") {
-			cns.push(unescapeValue(attrs[0].slice(eq + 1).trim()));
+		const type = attrs[0].slice(0, eq);
+		const value = attrs[0].slice(eq + 1);
+		if (/cn\s*=/i.test(value) || value.includes("/")) {
+			throw new SubjectDnError(
+				'an attribute value contains "CN=" or "/"'
+			);
 		}
+		if (type.toUpperCase() === "CN") cns.push(value);
 	}
 	if (cns.length !== 1) {
 		throw new SubjectDnError(
@@ -85,5 +74,9 @@ export function singleCommonName(rfc2253: string): string {
 		);
 	}
 	if (!cns[0]) throw new SubjectDnError("empty CN");
+	// The pattern has no escapable character, so the printed value is the CN.
+	if (!CN_PATTERN.test(cns[0])) {
+		throw new SubjectDnError("CN outside [A-Za-z0-9._-]{1,64}");
+	}
 	return cns[0];
 }
