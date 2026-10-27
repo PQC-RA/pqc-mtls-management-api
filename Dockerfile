@@ -42,9 +42,12 @@ RUN pnpm config set ignore-scripts true && pnpm install --frozen-lockfile
 COPY . ./
 
 RUN pnpm build
+# Only production dependencies go into the runtime image: dev tooling (test
+# runners, linters, templating) is not shipped.
+RUN pnpm prune --prod --ignore-scripts
 
 # Runtime stage – ubuntu:24.04 provides glibc 2.39 required by PQ OpenSSL build
-FROM ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
+FROM ubuntu:24.04@sha256:24737cef17f4e22b1977df7d9a05e77c4e28b7da5b8911f8d8ccda136bf3573c
 
 WORKDIR /usr/src/app
 
@@ -60,8 +63,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 	&& curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /usr/share/keyrings/nodesource.gpg \
 	&& echo "deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" > /etc/apt/sources.list.d/nodesource.list \
 	&& apt-get update \
-	&& apt-get install -y --no-install-recommends nodejs=22.23.1-1nodesource1 \
+	&& apt-get install -y --no-install-recommends nodejs=22.23.4-1nodesource1 \
 	&& node -v | grep -qE '^v22\.' \
+	&& rm -rf /usr/lib/node_modules/npm /usr/bin/npm /usr/bin/npx /usr/lib/node_modules/corepack /usr/bin/corepack \
 	&& rm -rf /var/lib/apt/lists/*
 
 # PQ OpenSSL runtime from the shared base image (pqc-mtls-openssl-base) – no local

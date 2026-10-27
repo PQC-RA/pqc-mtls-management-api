@@ -7,7 +7,7 @@ import { NodeSDK } from "@opentelemetry/sdk-node";
 // Automatically initializes OpenTelemetry before the application boots
 // Prometheus metrics are exposed on a separate server at http://localhost:8081/metrics
 const otelSDK = new NodeSDK({
-	metricReader: new PrometheusExporter({ port: 3001 }),
+	metricReaders: [new PrometheusExporter({ port: 3001 })],
 	instrumentations: [
 		getNodeAutoInstrumentations(),
 		new HttpInstrumentation(),
