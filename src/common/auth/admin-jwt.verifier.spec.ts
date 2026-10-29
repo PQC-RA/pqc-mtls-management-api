@@ -558,7 +558,7 @@ describe("signature mutations", () => {
 		expect(s.length).toBe(3309);
 		expect(await reason(() => verify(tok(s)))).toBe("signature");
 	});
-	it("refuses an ML-DSA-44 signature under admin-v2", async () => {
+	it("refuses an ML-DSA-44 signature under admin-v2 (2,420 bytes: refused by the length check)", async () => {
 		const k44 = await fx.genKey("ML-DSA-44");
 		expect(
 			await reason(async () =>

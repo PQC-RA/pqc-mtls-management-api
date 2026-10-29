@@ -318,8 +318,9 @@ export function checkAdminClaims(
  * refuses (fails closed) instead of evicting live entries.
  */
 export class JtiCache {
+	// Insertion order is expiry order (one constant TTL; a reused key is
+	// deleted before it is set again), so pruning stops at the first live entry.
 	private readonly seen = new Map<string, number>();
-	private inserts = 0;
 
 	constructor(
 		private readonly ttlS = JTI_TTL_S,
@@ -328,19 +329,18 @@ export class JtiCache {
 
 	/** Returns false if jti was already used (replay) or the cache is full. */
 	useOnce(jti: string, nowS: number): boolean {
-		const until = this.seen.get(jti);
-		if (until !== undefined && until > nowS) return false;
-		if (++this.inserts % 1024 === 0 || this.seen.size >= this.maxEntries) {
-			this.prune(nowS);
-		}
+		this.prune(nowS);
+		if (this.seen.has(jti)) return false;
 		if (this.seen.size >= this.maxEntries) return false;
 		this.seen.set(jti, nowS + this.ttlS);
 		return true;
 	}
 
+	/** Drops expired entries from the head; O(expired), not O(size). */
 	prune(nowS: number): void {
 		for (const [k, until] of this.seen) {
-			if (until <= nowS) this.seen.delete(k);
+			if (until > nowS) break;
+			this.seen.delete(k);
 		}
 	}
 

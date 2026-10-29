@@ -287,6 +287,16 @@ describe("JwtAuthGuard, end state (admin-v2 only)", () => {
 		).rejects.toThrow(ForbiddenException);
 	});
 
+	it("a token of a fingerprint not on the allowlist does not use up a jti (403 both times)", async () => {
+		const t = await v2Token({ fpr: "deadbeef" });
+		await expect(
+			guard.canActivate(makeContext(`Bearer ${t}`))
+		).rejects.toThrow(ForbiddenException);
+		await expect(
+			guard.canActivate(makeContext(`Bearer ${t}`))
+		).rejects.toThrow(ForbiddenException);
+	});
+
 	it("refuses a token without fpr as invalid (401)", async () => {
 		await expect(
 			guard.canActivate(

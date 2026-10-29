@@ -65,13 +65,13 @@ it("refuses an ML-DSA-65 leaf from another CA", async () => {
 	const url = await serve(await fx.leaf("ML-DSA-65", other, SAN));
 	await expect(
 		makeJwksFetcher({ ca: pinned() })(url, MAX_JWKS_BYTES)
-	).rejects.toThrow();
+	).rejects.toMatchObject({ code: "UNABLE_TO_VERIFY_LEAF_SIGNATURE" });
 	await expect(
 		makeJwksFetcher({ ca: pinned(), leafAlg: "ML-DSA-65" })(
 			url,
 			MAX_JWKS_BYTES
 		)
-	).rejects.toThrow();
+	).rejects.toMatchObject({ code: "UNABLE_TO_VERIFY_LEAF_SIGNATURE" });
 });
 
 it("refuses an RSA leaf from another (RSA) CA", async () => {
@@ -79,7 +79,7 @@ it("refuses an RSA leaf from another (RSA) CA", async () => {
 	const url = await serve(await fx.leaf("RSA", other, SAN));
 	await expect(
 		makeJwksFetcher({ ca: pinned() })(url, MAX_JWKS_BYTES)
-	).rejects.toThrow();
+	).rejects.toMatchObject({ code: "UNABLE_TO_VERIFY_LEAF_SIGNATURE" });
 });
 
 it("an RSA leaf from the pinned CA passes chain validation, and is refused by the leaf-type check", async () => {
@@ -104,7 +104,7 @@ it("refuses a leaf whose name is not the one asked for", async () => {
 			url,
 			MAX_JWKS_BYTES
 		)
-	).rejects.toThrow();
+	).rejects.toMatchObject({ code: "ERR_TLS_CERT_ALTNAME_INVALID" });
 });
 
 it("refuses a body over the cap", async () => {

@@ -10,7 +10,8 @@
  * Objects are created without a prototype, so a member named `__proto__` or
  * `constructor` is plain data. Depth and size are capped. Anything that is not
  * exactly one JSON value (leading/trailing garbage, NaN, comments, single
- * quotes, unescaped control characters, lone surrogates in escapes) throws.
+ * quotes, unescaped control characters, bad escapes) throws. Lone surrogates
+ * from \u escapes are kept as data; the callers compare strings exactly.
  */
 
 export class StrictJsonError extends Error {}

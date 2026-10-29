@@ -179,17 +179,11 @@ export class JwtAuthGuard implements CanActivate {
 				path: requestPath(request),
 				requireBinding: kid === "admin-v2",
 			});
-			// Last, so that only a token that passed everything else uses up its jti.
-			if (
-				claims.jti !== undefined &&
-				!this.jtiCache.useOnce(claims.jti, nowS)
-			) {
-				throw new AdminJwtError("replay", "jti already used");
-			}
 		} catch (e) {
 			if (e instanceof AdminJwtError) {
+				// The message can quote unauthenticated token content: printable ASCII only.
 				this.logger.warn(
-					`Admin token refused: ${e.reason} (${e.message})`
+					`Admin token refused: ${e.reason} (${e.message.replace(/[^\x20-\x7e]/g, "?").slice(0, 200)})`
 				);
 				throw new UnauthorizedException(
 					e.reason === "expired"
@@ -218,6 +212,20 @@ export class JwtAuthGuard implements CanActivate {
 			throw new ForbiddenException(
 				"Admin authorization denied – certificate is not on the admin allowlist"
 			);
+		}
+
+		// 4. jti, last: only a token that passed everything else, including the
+		//    allowlist, uses up a cache entry. Otherwise any CA-verified client
+		//    (the gateway mints for every verified certificate) could fill the
+		//    cache and lock the admins out.
+		if (
+			claims.jti !== undefined &&
+			!this.jtiCache.useOnce(claims.jti, Math.floor(Date.now() / 1000))
+		) {
+			this.logger.warn(
+				"Admin token refused: replay (jti already used, or the jti cache is full)"
+			);
+			throw new UnauthorizedException("Invalid admin token");
 		}
 
 		const identity: AdminIdentity = { sub: claims.sub, fpr, role };
