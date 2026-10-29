@@ -624,7 +624,7 @@ describe("claims", () => {
 		expect(await run({}, { method: "DELETE" })).toBe("htm");
 		expect(await run({}, { path: "/api/admin/crl" })).toBe("htu");
 	});
-	it("admin-v1 without jti/htm/htu passes (old gateways, 7-day window); with them they are checked", async () => {
+	it("admin-v1 without jti/htm/htu passes (old gateways, dual window); with them they are checked", async () => {
 		expect(
 			await run(
 				{ jti: undefined, htm: undefined, htu: undefined },

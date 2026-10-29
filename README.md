@@ -156,7 +156,7 @@ See `.env.example` for the full annotated list. Key variables:
 | `JWT_EXPECTED_ISSUER` | `pqc-gateway` | required JWT `iss` |
 | `JWT_EXPECTED_AUDIENCE` | `pqc-mtls-management-api` | required JWT `aud` |
 | `GATEWAY_JWKS_URI` | `http://gateway:8081/.well-known/jwks.json` | gateway JWKS |
-| `JWT_EXPECTED_KID` | `admin-v1` | admin token kids accepted, comma-separated, from the fixed table (`admin-v1`, `admin-v2`). ADR-022 cut-over: `admin-v1,admin-v2` before the gateway switches, `admin-v2` alone after the 7-day window |
+| `JWT_EXPECTED_KID` | `admin-v1` | admin token kids accepted, comma-separated, from the fixed table (`admin-v1`, `admin-v2`). ADR-022 cut-over: `admin-v1,admin-v2` before the gateway switches, `admin-v2` alone after the dual window (48 h on live, ADR-022 amendment 2026-10-29) |
 | `ADMIN_V2_PUB_SHA256` | *(unset → admin-v2 refused)* | SHA-256 (hex) of the admin-v2 raw ML-DSA-65 public key; the gateway's `scripts/generate-gateway-secrets.sh` prints it |
 | `GATEWAY_TLS_LEAF_ALG` | *(unset → any leaf that chains to `NODE_EXTRA_CA_CERTS`)* | `ML-DSA-65`: fetch the JWKS only from a `:8081` presenting an ML-DSA-65 certificate (the end state; an RSA leaf from the pinned CA would otherwise pass) |
 | `CORS_ALLOWED_ORIGINS` | *(deny)* | comma-separated browser origins |
