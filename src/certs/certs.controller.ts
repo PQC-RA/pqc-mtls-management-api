@@ -60,6 +60,29 @@ import { EnrollHmacGuard } from "@/common/guards/enroll-hmac.guard";
 import { CN_PATTERN } from "../common/subject-dn.util";
 
 /**
+ * The profile a new enrollment token carries. An explicit profile wins; "legacy" means the
+ * standard 365-day certificate. When the caller names none, DEFAULT_ENROLLMENT_PROFILE decides
+ * (only "client-30d" is accepted there, and only with renewal enabled); otherwise legacy.
+ */
+export function resolveEnrollmentProfile(
+	requested?: string
+): "client-30d" | "demo-120s" | undefined {
+	if (requested === "legacy") return undefined;
+	if (requested === "client-30d" || requested === "demo-120s")
+		return requested;
+	const def = (process.env.DEFAULT_ENROLLMENT_PROFILE ?? "").trim();
+	if (def === "" || def === "legacy") return undefined;
+	if (def !== "client-30d") {
+		throw new HttpException(
+			"DEFAULT_ENROLLMENT_PROFILE must be client-30d or legacy",
+			HttpStatus.INTERNAL_SERVER_ERROR
+		);
+	}
+	if (process.env.RENEWAL_ENABLED !== "1") return undefined;
+	return "client-30d";
+}
+
+/**
  * DTO for validating the :serial path parameter.
  * The global ValidationPipe applies class-validator decorators to @Param() objects.
  */
@@ -138,6 +161,7 @@ export class CertsController {
 		params: c => ({
 			cn: c.query.cn,
 			ttl: c.query.ttl,
+			profile: c.query.profile ?? "default",
 			tokenId: tokenId(
 				(c.result as { token?: string } | undefined)?.token
 			),
@@ -173,7 +197,7 @@ export class CertsController {
 		required: false,
 		example: "client-30d",
 		description:
-			"Renewal profile for the certificate (client-30d or demo-120s). Accepted only when renewal is enabled on this deployment; omitted = the standard 365-day certificate.",
+			"Certificate profile: client-30d (30 days, renewed by the client over mTLS), demo-120s, or legacy (the standard 365-day certificate, not renewable). Renewal profiles are accepted only when renewal is enabled on this deployment. Omitted = the deployment default (DEFAULT_ENROLLMENT_PROFILE, otherwise legacy).",
 	})
 	async createEnrollmentToken(
 		@Query("cn") cn: string,
@@ -183,13 +207,15 @@ export class CertsController {
 		if (
 			profile !== undefined &&
 			profile !== "client-30d" &&
-			profile !== "demo-120s"
+			profile !== "demo-120s" &&
+			profile !== "legacy"
 		) {
 			throw new HttpException(
-				"profile must be client-30d or demo-120s",
+				"profile must be client-30d, demo-120s or legacy",
 				HttpStatus.BAD_REQUEST
 			);
 		}
+		const effective = resolveEnrollmentProfile(profile);
 		if (!cn || cn.trim() === "") {
 			throw new HttpException(
 				"cn query parameter is required – specify the CN the CSR must contain",
@@ -204,7 +230,7 @@ export class CertsController {
 		const token = await this.certsService.createEnrollmentToken(
 			ttl,
 			allowedCn,
-			profile as "client-30d" | "demo-120s" | undefined
+			effective
 		);
 		return { token, expiresAt, allowedCn };
 	}

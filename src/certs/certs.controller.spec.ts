@@ -129,6 +129,66 @@ describe("CertsController", () => {
 		);
 	});
 
+	describe("enrollment token profile (DEFAULT_ENROLLMENT_PROFILE)", () => {
+		const saved = { ...process.env };
+		afterEach(() => {
+			process.env = { ...saved };
+		});
+		const created = async (profile?: string) => {
+			certsService.createEnrollmentToken.mockResolvedValue("enroll_xyz");
+			await controller.createEnrollmentToken("my-service", 3600, profile);
+			return certsService.createEnrollmentToken.mock.calls.at(-1)?.[2];
+		};
+
+		it("no default configured: an omitted profile stays legacy", async () => {
+			delete process.env.DEFAULT_ENROLLMENT_PROFILE;
+			process.env.RENEWAL_ENABLED = "1";
+			expect(await created()).toBeUndefined();
+		});
+
+		it("default client-30d with renewal on: an omitted profile becomes client-30d", async () => {
+			process.env.DEFAULT_ENROLLMENT_PROFILE = "client-30d";
+			process.env.RENEWAL_ENABLED = "1";
+			expect(await created()).toBe("client-30d");
+		});
+
+		it("default client-30d with renewal off: an omitted profile stays legacy", async () => {
+			process.env.DEFAULT_ENROLLMENT_PROFILE = "client-30d";
+			delete process.env.RENEWAL_ENABLED;
+			expect(await created()).toBeUndefined();
+		});
+
+		it("explicit legacy overrides the default (clients that cannot renew)", async () => {
+			process.env.DEFAULT_ENROLLMENT_PROFILE = "client-30d";
+			process.env.RENEWAL_ENABLED = "1";
+			expect(await created("legacy")).toBeUndefined();
+		});
+
+		it("explicit demo-120s overrides the default", async () => {
+			process.env.DEFAULT_ENROLLMENT_PROFILE = "client-30d";
+			process.env.RENEWAL_ENABLED = "1";
+			expect(await created("demo-120s")).toBe("demo-120s");
+		});
+
+		it("an unknown profile is refused with 400", async () => {
+			await expect(
+				controller.createEnrollmentToken(
+					"my-service",
+					3600,
+					"client-90d"
+				)
+			).rejects.toMatchObject({ status: 400 });
+		});
+
+		it("an invalid default is a loud 500, never a silent fallback", async () => {
+			process.env.DEFAULT_ENROLLMENT_PROFILE = "demo-120s";
+			process.env.RENEWAL_ENABLED = "1";
+			await expect(
+				controller.createEnrollmentToken("my-service", 3600)
+			).rejects.toMatchObject({ status: 500 });
+		});
+	});
+
 	it("createEnrollmentToken throws 400 when cn is missing", async () => {
 		await expect(
 			controller.createEnrollmentToken("", 3600)
