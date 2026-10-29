@@ -66,8 +66,11 @@ jest.mock("jwks-rsa", () => {
  * End-to-end tests for the PQC Management API.
  *
  * Auth model exercised end-to-end (no mocks on the auth path):
- *  1. A fresh RSA key pair + local JWKS server simulate the gateway's signer.
- *  2. JWTs are signed with the pinned issuer/audience and a `fpr` claim.
+ *  1. A fresh ML-DSA-65 key (OpenSSL CLI, Node cannot sign ML-DSA) + a local
+ *     JWKS server with the gateway's entries simulate the gateway's signer;
+ *     the API runs in the ADR-022 end state (admin-v2 only, key pinned).
+ *  2. Every request gets its own token (jti single use, htm/htu bound), with
+ *     the pinned issuer/audience and a `fpr` claim.
  *  3. ADMIN_/AUDITOR_CERT_FINGERPRINTS map those fingerprints to roles.
  *  4. CONSOLE_ORIGIN drives the anti-CSRF guard on mutating routes.
  */
@@ -79,21 +82,10 @@ import * as path from "path";
 
 import { INestApplication, ValidationPipe } from "@nestjs/common";
 import { Test, TestingModule } from "@nestjs/testing";
-import * as jwt from "jsonwebtoken";
 import request from "supertest";
 import type { App } from "supertest/types";
 
-function publicKeyToJwk(
-	publicKey: crypto.KeyObject,
-	kid: string
-): Record<string, unknown> {
-	const jwk = publicKey.export({ format: "jwk" }) as Record<string, string>;
-	return {
-		keys: [
-			{ kty: "RSA", use: "sig", alg: "RS256", kid, n: jwk.n, e: jwk.e },
-		],
-	};
-}
+import { MldsaFixtures } from "./support/mldsa-openssl";
 
 function startJwksServer(
 	jwks: Record<string, unknown>
@@ -114,7 +106,8 @@ function startJwksServer(
 
 // ── Test fixtures ────────────────────────────────────────────────────────────
 
-const KEY_ID = "admin-v1";
+const KEY_ID = "admin-v2";
+const H_V2 = '{"alg":"ML-DSA-65","typ":"JWT","kid":"admin-v2"}';
 const ISSUER = "pqc-gateway";
 const AUDIENCE = "pqc-mtls-management-api";
 const CONSOLE_ORIGIN = "https://console.test";
@@ -125,54 +118,120 @@ const AUDITOR_FPR =
 const UNKNOWN_FPR =
 	"9999999999999999999999999999999999999999999999999999999999999999";
 
-let privateKey: crypto.KeyObject;
 let jwksServer: http.Server;
 let app: INestApplication<App>;
-let adminToken: string;
-let auditorToken: string;
+const fx = new MldsaFixtures();
+let v2KeyPath: string;
+const rsaPair = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
 
-/** Sign an RS256 JWT with the pinned issuer/audience and a fpr claim. */
-function signJwt(
-	overrides: { fpr?: string; sub?: string } & jwt.SignOptions = {}
+/**
+ * A fresh admin-v2 (ML-DSA-65) token per request, bound to its method and path
+ * as the gateway mints it (jti single use, htm, htu), signed by the OpenSSL CLI.
+ */
+function tok(
+	who: "admin" | "auditor" | "unknown" | "nofpr",
+	method: string,
+	url: string,
+	over: Record<string, unknown> = {},
+	keyPath = v2KeyPath
 ): string {
-	const { fpr, sub, ...signOpts } = overrides;
-	const claims: Record<string, unknown> = { sub: sub ?? "test-service" };
-	if (fpr !== undefined) claims.fpr = fpr;
-	return jwt.sign(
-		claims,
-		privateKey.export({ type: "pkcs8", format: "pem" }) as string,
-		{
-			algorithm: "RS256",
-			expiresIn: "5m",
-			keyid: KEY_ID,
-			issuer: ISSUER,
-			audience: AUDIENCE,
-			...signOpts,
-		}
-	);
+	const now = Math.floor(Date.now() / 1000);
+	const fpr = {
+		admin: ADMIN_FPR,
+		auditor: AUDITOR_FPR,
+		unknown: UNKNOWN_FPR,
+		nofpr: undefined,
+	}[who];
+	const claims = {
+		iss: ISSUER,
+		aud: AUDIENCE,
+		sub: `ops-${who}`,
+		fpr,
+		iat: now,
+		exp: now + 60,
+		jti: crypto.randomBytes(16).toString("base64url"),
+		htm: method,
+		htu: url.split("?")[0],
+		...over,
+	};
+	return fx.tokenSync(keyPath, H_V2, JSON.stringify(claims));
+}
+
+/** An RS256 admin-v1 token, as the pre-ADR-022 gateway minted it. */
+function v1Tok(kid = "admin-v1", aud = AUDIENCE): string {
+	const now = Math.floor(Date.now() / 1000);
+	const h = Buffer.from(
+		JSON.stringify({ alg: "RS256", typ: "JWT", kid })
+	).toString("base64url");
+	const p = Buffer.from(
+		JSON.stringify({
+			iss: ISSUER,
+			aud,
+			sub: "x",
+			fpr: ADMIN_FPR,
+			iat: now,
+			exp: now + 60,
+		})
+	).toString("base64url");
+	return `${h}.${p}.${crypto.sign("sha256", Buffer.from(`${h}.${p}`), rsaPair.privateKey).toString("base64url")}`;
 }
 
 /** A POST/PUT/DELETE request pre-loaded with a valid CSRF Origin + header. */
 function mutating(
 	method: "post" | "put" | "delete",
 	url: string,
-	token: string
+	who: "admin" | "auditor"
 ) {
 	return request(app.getHttpServer())
 		[method](url)
-		.set("Authorization", `Bearer ${token}`)
+		.set("Authorization", `Bearer ${tok(who, method.toUpperCase(), url)}`)
 		.set("Origin", CONSOLE_ORIGIN)
 		.set("X-PQC-CSRF", "1");
 }
 
 beforeAll(async () => {
-	const pair = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
-	privateKey = pair.privateKey;
-
-	const { server, url } = await startJwksServer(
-		publicKeyToJwk(pair.publicKey, KEY_ID)
-	);
+	const v2 = await fx.genKey();
+	v2KeyPath = v2.keyPath;
+	const rsaJwk = rsaPair.publicKey.export({ format: "jwk" });
+	const { server, url } = await startJwksServer({
+		keys: [
+			{
+				...rsaJwk,
+				kty: "RSA",
+				use: "sig",
+				alg: "RS256",
+				kid: "backend-v1",
+			},
+			{
+				...rsaJwk,
+				kty: "RSA",
+				use: "sig",
+				alg: "RS256",
+				kid: "admin-v1",
+			},
+			{
+				kty: "AKP",
+				use: "sig",
+				alg: "ML-DSA-65",
+				kid: KEY_ID,
+				pub: v2.pub.toString("base64url"),
+			},
+			{
+				...rsaJwk,
+				kty: "RSA",
+				use: "sig",
+				alg: "RS256",
+				kid: "lookup-v1",
+			},
+		],
+	});
 	jwksServer = server;
+	// ADR-022 end state: only admin-v2 is accepted, its key pinned.
+	process.env.JWT_EXPECTED_KID = KEY_ID;
+	process.env.ADMIN_V2_PUB_SHA256 = crypto
+		.createHash("sha256")
+		.update(v2.pub)
+		.digest("hex");
 
 	// Configure the guards BEFORE the app boots (they read env at construction).
 	process.env.GATEWAY_JWKS_URI = url;
@@ -200,13 +259,11 @@ beforeAll(async () => {
 	);
 	app.setGlobalPrefix("api");
 	await app.init();
-
-	adminToken = signJwt({ fpr: ADMIN_FPR, sub: "ops-admin" });
-	auditorToken = signJwt({ fpr: AUDITOR_FPR, sub: "ops-auditor" });
 }, 30000);
 
 afterAll(async () => {
 	await app.close();
+	fx.cleanup();
 	await new Promise<void>((res, rej) =>
 		jwksServer.close(err => (err ? rej(err) : res()))
 	);
@@ -223,7 +280,10 @@ describe("GET /api/admin/health", () => {
 	it("returns a health status (200 or 503) with a valid admin token", async () => {
 		const res = await request(app.getHttpServer())
 			.get("/api/admin/health")
-			.set("Authorization", `Bearer ${adminToken}`);
+			.set(
+				"Authorization",
+				`Bearer ${tok("admin", "GET", "/api/admin/health")}`
+			);
 		expect([200, 503]).toContain(res.status);
 	});
 });
@@ -244,7 +304,11 @@ describe("Admin API auth gate", () => {
 	});
 
 	it("401 with an expired token", async () => {
-		const expired = signJwt({ fpr: ADMIN_FPR, expiresIn: "-1s" });
+		const now = Math.floor(Date.now() / 1000);
+		const expired = tok("admin", "GET", "/api/admin/certs", {
+			iat: now - 61,
+			exp: now - 1,
+		});
 		const res = await request(app.getHttpServer())
 			.get("/api/admin/certs")
 			.set("Authorization", `Bearer ${expired}`);
@@ -254,39 +318,74 @@ describe("Admin API auth gate", () => {
 	it("403 when the fpr is not on any allowlist", async () => {
 		const res = await request(app.getHttpServer())
 			.get("/api/admin/certs")
-			.set("Authorization", `Bearer ${signJwt({ fpr: UNKNOWN_FPR })}`);
+			.set(
+				"Authorization",
+				`Bearer ${tok("unknown", "GET", "/api/admin/certs")}`
+			);
 		expect(res.status).toBe(403);
 	});
 
-	it("403 when the token has no fpr claim", async () => {
+	it("401 when the token has no fpr claim (a required claim, ADR-022)", async () => {
 		const res = await request(app.getHttpServer())
 			.get("/api/admin/certs")
-			.set("Authorization", `Bearer ${signJwt({})}`);
-		expect(res.status).toBe(403);
+			.set(
+				"Authorization",
+				`Bearer ${tok("nofpr", "GET", "/api/admin/certs")}`
+			);
+		expect(res.status).toBe(401);
 	});
 
 	it("401 with a token signed by the wrong key", async () => {
-		const wrongPair = crypto.generateKeyPairSync("rsa", {
-			modulusLength: 2048,
-		});
-		const wrongToken = jwt.sign(
-			{ sub: "x", fpr: ADMIN_FPR },
-			wrongPair.privateKey.export({
-				type: "pkcs8",
-				format: "pem",
-			}) as string,
-			{
-				algorithm: "RS256",
-				expiresIn: "5m",
-				keyid: KEY_ID,
-				issuer: ISSUER,
-				audience: AUDIENCE,
-			}
-		);
+		const other = await fx.genKey();
 		const res = await request(app.getHttpServer())
 			.get("/api/admin/certs")
-			.set("Authorization", `Bearer ${wrongToken}`);
+			.set(
+				"Authorization",
+				`Bearer ${tok("admin", "GET", "/api/admin/certs", {}, other.keyPath)}`
+			);
 		expect(res.status).toBe(401);
+	});
+
+	it("401 on a replay of a token that was just accepted", async () => {
+		const t = tok("admin", "GET", "/api/admin/whoami");
+		const first = await request(app.getHttpServer())
+			.get("/api/admin/whoami")
+			.set("Authorization", `Bearer ${t}`);
+		expect(first.status).toBe(200);
+		const again = await request(app.getHttpServer())
+			.get("/api/admin/whoami")
+			.set("Authorization", `Bearer ${t}`);
+		expect(again.status).toBe(401);
+	});
+
+	it("401 when the token is bound to another path or method", async () => {
+		const res = await request(app.getHttpServer())
+			.get("/api/admin/certs")
+			.set(
+				"Authorization",
+				`Bearer ${tok("admin", "GET", "/api/admin/whoami")}`
+			);
+		expect(res.status).toBe(401);
+		const res2 = await request(app.getHttpServer())
+			.get("/api/admin/certs")
+			.set(
+				"Authorization",
+				`Bearer ${tok("admin", "DELETE", "/api/admin/certs")}`
+			);
+		expect(res2.status).toBe(401);
+	});
+
+	it("401 for an admin-v1 (RS256) token in the end state, and for Token 1 / Token 2", async () => {
+		for (const t of [
+			v1Tok(),
+			v1Tok("backend-v1", "pqc-backend"),
+			v1Tok("lookup-v1", "pqc-cert-lookup"),
+		]) {
+			const res = await request(app.getHttpServer())
+				.get("/api/admin/certs")
+				.set("Authorization", `Bearer ${t}`);
+			expect(res.status).toBe(401);
+		}
 	});
 });
 
@@ -296,7 +395,10 @@ describe("GET /api/admin/whoami", () => {
 	it("returns the admin identity and role", async () => {
 		const res = await request(app.getHttpServer())
 			.get("/api/admin/whoami")
-			.set("Authorization", `Bearer ${adminToken}`);
+			.set(
+				"Authorization",
+				`Bearer ${tok("admin", "GET", "/api/admin/whoami")}`
+			);
 		expect(res.status).toBe(200);
 		expect(res.body).toEqual({
 			sub: "ops-admin",
@@ -308,7 +410,10 @@ describe("GET /api/admin/whoami", () => {
 	it("reports the auditor role for an auditor cert", async () => {
 		const res = await request(app.getHttpServer())
 			.get("/api/admin/whoami")
-			.set("Authorization", `Bearer ${auditorToken}`);
+			.set(
+				"Authorization",
+				`Bearer ${tok("auditor", "GET", "/api/admin/whoami")}`
+			);
 		expect(res.status).toBe(200);
 		expect(res.body.role).toBe("auditor");
 	});
@@ -325,7 +430,10 @@ describe("GET /api/admin/certs", () => {
 	it("admin passes auth (non-401/403)", async () => {
 		const res = await request(app.getHttpServer())
 			.get("/api/admin/certs")
-			.set("Authorization", `Bearer ${adminToken}`);
+			.set(
+				"Authorization",
+				`Bearer ${tok("admin", "GET", "/api/admin/certs")}`
+			);
 		expect(res.status).not.toBe(401);
 		expect(res.status).not.toBe(403);
 	});
@@ -333,7 +441,10 @@ describe("GET /api/admin/certs", () => {
 	it("auditor may read certs", async () => {
 		const res = await request(app.getHttpServer())
 			.get("/api/admin/certs")
-			.set("Authorization", `Bearer ${auditorToken}`);
+			.set(
+				"Authorization",
+				`Bearer ${tok("auditor", "GET", "/api/admin/certs")}`
+			);
 		expect(res.status).not.toBe(401);
 		expect(res.status).not.toBe(403);
 	});
@@ -352,7 +463,10 @@ describe("POST /api/admin/certs/enrollment-tokens (RBAC + CSRF)", () => {
 	it("403 (CSRF) when Origin / X-PQC-CSRF are missing", async () => {
 		const res = await request(app.getHttpServer())
 			.post("/api/admin/certs/enrollment-tokens")
-			.set("Authorization", `Bearer ${adminToken}`)
+			.set(
+				"Authorization",
+				`Bearer ${tok("admin", "POST", "/api/admin/certs/enrollment-tokens")}`
+			)
 			.query({ cn: "svc", ttl: 3600 });
 		expect(res.status).toBe(403);
 	});
@@ -361,7 +475,7 @@ describe("POST /api/admin/certs/enrollment-tokens (RBAC + CSRF)", () => {
 		const res = await mutating(
 			"post",
 			"/api/admin/certs/enrollment-tokens",
-			auditorToken
+			"auditor"
 		).query({ cn: "svc", ttl: 3600 });
 		expect(res.status).toBe(403);
 	});
@@ -370,7 +484,7 @@ describe("POST /api/admin/certs/enrollment-tokens (RBAC + CSRF)", () => {
 		const res = await mutating(
 			"post",
 			"/api/admin/certs/enrollment-tokens",
-			adminToken
+			"admin"
 		).query({ cn: "svc", ttl: 3600 });
 		expect(res.status).toBe(201);
 		expect(res.body.token).toMatch(/^enroll_[0-9a-f]+$/);
@@ -382,13 +496,19 @@ describe("GET /api/admin/certs/enrollment-tokens", () => {
 	it("auditor may NOT read the token list (it holds bearer values)", async () => {
 		const res = await request(app.getHttpServer())
 			.get("/api/admin/certs/enrollment-tokens")
-			.set("Authorization", `Bearer ${auditorToken}`);
+			.set(
+				"Authorization",
+				`Bearer ${tok("auditor", "GET", "/api/admin/certs/enrollment-tokens")}`
+			);
 		expect(res.status).toBe(403);
 	});
 	it("admin reads the token list", async () => {
 		const res = await request(app.getHttpServer())
 			.get("/api/admin/certs/enrollment-tokens")
-			.set("Authorization", `Bearer ${adminToken}`);
+			.set(
+				"Authorization",
+				`Bearer ${tok("admin", "GET", "/api/admin/certs/enrollment-tokens")}`
+			);
 		expect(res.status).toBe(200);
 		expect(Array.isArray(res.body)).toBe(true);
 	});
@@ -407,7 +527,10 @@ describe("GET /api/admin/audit/logs", () => {
 	it("admin passes auth", async () => {
 		const res = await request(app.getHttpServer())
 			.get("/api/admin/audit/logs")
-			.set("Authorization", `Bearer ${adminToken}`);
+			.set(
+				"Authorization",
+				`Bearer ${tok("admin", "GET", "/api/admin/audit/logs")}`
+			);
 		expect(res.status).not.toBe(401);
 		expect(res.status).not.toBe(403);
 	});
@@ -415,7 +538,10 @@ describe("GET /api/admin/audit/logs", () => {
 	it("400 for lines=0 (below minimum)", async () => {
 		const res = await request(app.getHttpServer())
 			.get("/api/admin/audit/logs")
-			.set("Authorization", `Bearer ${adminToken}`)
+			.set(
+				"Authorization",
+				`Bearer ${tok("admin", "GET", "/api/admin/audit/logs")}`
+			)
 			.query({ lines: 0 });
 		expect(res.status).toBe(400);
 	});
@@ -423,7 +549,10 @@ describe("GET /api/admin/audit/logs", () => {
 	it("400 for lines above the maximum", async () => {
 		const res = await request(app.getHttpServer())
 			.get("/api/admin/audit/logs")
-			.set("Authorization", `Bearer ${adminToken}`)
+			.set(
+				"Authorization",
+				`Bearer ${tok("admin", "GET", "/api/admin/audit/logs")}`
+			)
 			.query({ lines: 99999 });
 		expect(res.status).toBe(400);
 	});
@@ -431,7 +560,10 @@ describe("GET /api/admin/audit/logs", () => {
 	it("accepts a valid lines value", async () => {
 		const res = await request(app.getHttpServer())
 			.get("/api/admin/audit/logs")
-			.set("Authorization", `Bearer ${adminToken}`)
+			.set(
+				"Authorization",
+				`Bearer ${tok("admin", "GET", "/api/admin/audit/logs")}`
+			)
 			.query({ lines: 500 });
 		expect(res.status).not.toBe(400);
 	});
@@ -448,7 +580,10 @@ describe("GET /api/admin/audit/admin-actions", () => {
 	it("auditor may read the admin-action trail", async () => {
 		const res = await request(app.getHttpServer())
 			.get("/api/admin/audit/admin-actions")
-			.set("Authorization", `Bearer ${auditorToken}`);
+			.set(
+				"Authorization",
+				`Bearer ${tok("auditor", "GET", "/api/admin/audit/admin-actions")}`
+			);
 		expect(res.status).toBe(200);
 		expect(Array.isArray(res.body)).toBe(true);
 	});
@@ -467,7 +602,10 @@ describe("GET /api/admin/policy/routes", () => {
 	it("admin passes auth", async () => {
 		const res = await request(app.getHttpServer())
 			.get("/api/admin/policy/routes")
-			.set("Authorization", `Bearer ${adminToken}`);
+			.set(
+				"Authorization",
+				`Bearer ${tok("admin", "GET", "/api/admin/policy/routes")}`
+			);
 		expect(res.status).not.toBe(401);
 		expect(res.status).not.toBe(403);
 	});
@@ -490,7 +628,10 @@ describe("GET /api/admin/policy/orgs", () => {
 	it("resolves to listOrgs, not the orgs/:orgId route – returns an object, not a 404", async () => {
 		const res = await request(app.getHttpServer())
 			.get("/api/admin/policy/orgs")
-			.set("Authorization", `Bearer ${adminToken}`);
+			.set(
+				"Authorization",
+				`Bearer ${tok("admin", "GET", "/api/admin/policy/orgs")}`
+			);
 		expect(res.status).toBe(200);
 		expect(res.body).toEqual(expect.any(Object));
 		expect(res.body).not.toHaveProperty("statusCode", 404);
@@ -503,7 +644,10 @@ describe("GET /api/admin/policy/orgs/:orgId", () => {
 	it("still 404s for an unknown org ID (the :orgId route still matches)", async () => {
 		const res = await request(app.getHttpServer())
 			.get("/api/admin/policy/orgs/no-such-org")
-			.set("Authorization", `Bearer ${adminToken}`);
+			.set(
+				"Authorization",
+				`Bearer ${tok("admin", "GET", "/api/admin/policy/orgs/no-such-org")}`
+			);
 		expect(res.status).toBe(404);
 	});
 });
@@ -525,11 +669,7 @@ describe("POST /api/admin/policy/routes?dryRun=1", () => {
 	};
 
 	it("returns a validation+diff result without pushing", async () => {
-		const res = await mutating(
-			"post",
-			"/api/admin/policy/routes",
-			adminToken
-		)
+		const res = await mutating("post", "/api/admin/policy/routes", "admin")
 			.query({ dryRun: 1 })
 			.send(doc);
 		expect(res.status).toBe(200);

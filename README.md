@@ -13,16 +13,34 @@ Manages the post-quantum PKI and gateway policy:
 
 All `/api/admin/*` routes are protected by a **global** `JwtAuthGuard`
 (`APP_GUARD`) – every route is authenticated by default; a route is only public
-if it carries `@Public()`. The gateway mints a short-lived RS256 JWT from the
-verified mTLS client certificate and injects it as `Authorization: Bearer ...`.
+if it carries `@Public()`. The gateway mints a short-lived JWT from the
+verified mTLS client certificate and injects it as `Authorization: Bearer ...`:
+kid `admin-v1` (RS256) or, from ADR-022, `admin-v2` (ML-DSA-65, RFC 9964).
 
-The guard:
-- verifies the RS256 signature against the gateway JWKS (by `kid`),
-- pins `issuer` and `audience`,
+The guard (`src/common/auth/admin-jwt.verifier.ts`, hand-rolled because no
+Node JOSE library implements RFC 9964):
+- caps the token length, requires three canonical base64url segments and JSON
+  objects without duplicate members, and a header of exactly `alg`, `typ`
+  (`"JWT"`) and `kid`;
+- maps the `kid` to its algorithm through a **fixed table** (`admin-v1` →
+  RS256 with an RSA key of 2048+ bits, `admin-v2` → pure ML-DSA-65 with an
+  empty context); the header's `alg` must match, and only the kids in
+  `JWT_EXPECTED_KID` are accepted;
+- takes the key from the gateway JWKS (one entry per kid, `kty`/`alg` as in the
+  table); the `admin-v2` key must also match the SHA-256 pin
+  `ADMIN_V2_PUB_SHA256`, so a JWKS served by anyone else cannot substitute it;
+- checks `exp` (required), `exp - iat <= 60`, `iat <= now + 5 s`, exact `iss`
+  and `aud` strings, `fpr`; for `admin-v2` also `jti` (single use, kept 120 s
+  in memory: one API instance), `htm` and `htu` (this request's method and
+  path, without the query string);
 - **authorizes by certificate fingerprint** against an explicit allowlist
   (`ADMIN_CERT_FINGERPRINTS`) – never by a cert subject field, so an enrollee
   cannot self-authorize by requesting `OU=admin` in a CSR. Authorization
   **fails closed** when the allowlist is empty.
+
+The token crosses the gateway-to-API hop in plain HTTP inside the Docker
+network; `jti` and `htm`/`htu` limit what an observer on that hop can do with
+one (no replay, no other route), TLS on that hop is later work.
 
 ### Role-based access control (RBAC)
 
@@ -118,6 +136,12 @@ pnpm build              # production build (dist/)
 OpenSSL 3.6 (with ML-DSA/ML-KEM) must be available at `/opt/openssl-3.6.2/bin/openssl`
 (or set `OPENSSL_BIN`) for the cert-signing/revocation code paths.
 
+The tests need an OpenSSL 3.5+ **CLI** too: Node 22 verifies ML-DSA but cannot
+sign it, so the admin-v2 fixtures are signed by `openssl` through `execFile`.
+Set `PQC_TEST_OPENSSL` to one (otherwise `/opt/openssl/bin/openssl` and
+`/opt/openssl-*/bin/openssl` are tried); without one those suites fail, they do
+not skip.
+
 ## Configuration (env)
 
 See `.env.example` for the full annotated list. Key variables:
@@ -132,10 +156,13 @@ See `.env.example` for the full annotated list. Key variables:
 | `JWT_EXPECTED_ISSUER` | `pqc-gateway` | required JWT `iss` |
 | `JWT_EXPECTED_AUDIENCE` | `pqc-mtls-management-api` | required JWT `aud` |
 | `GATEWAY_JWKS_URI` | `http://gateway:8081/.well-known/jwks.json` | gateway JWKS |
+| `JWT_EXPECTED_KID` | `admin-v1` | admin token kids accepted, comma-separated, from the fixed table (`admin-v1`, `admin-v2`). ADR-022 cut-over: `admin-v1,admin-v2` before the gateway switches, `admin-v2` alone after the 7-day window |
+| `ADMIN_V2_PUB_SHA256` | *(unset → admin-v2 refused)* | SHA-256 (hex) of the admin-v2 raw ML-DSA-65 public key; the gateway's `scripts/generate-gateway-secrets.sh` prints it |
+| `GATEWAY_TLS_LEAF_ALG` | *(unset → any leaf that chains to `NODE_EXTRA_CA_CERTS`)* | `ML-DSA-65`: fetch the JWKS only from a `:8081` presenting an ML-DSA-65 certificate (the end state; an RSA leaf from the pinned CA would otherwise pass) |
 | `CORS_ALLOWED_ORIGINS` | *(deny)* | comma-separated browser origins |
 | `REDIS_URL` | *(in-memory)* | durable enrollment-token store (required in production) |
 | `PKI_*` path overrides | see `src/common/config/pki.config.ts` | CA directory, OpenSSL binary, CRL and renew-script paths. The defaults match the layout the gateway's compose file mounts |
-| `NODE_EXTRA_CA_CERTS` | *(unset)* | trust anchor for the gateway's internal TLS. Required for the JWKS fetch to verify; compose sets it to the internal CA |
+| `NODE_EXTRA_CA_CERTS` | *(unset)* | trust anchor for the gateway's internal TLS (an ML-DSA-65 CA from ADR-022; Node 22 validates it). Required for the JWKS fetch to verify; compose sets it to the internal CA. Read only at start |
 
 ## API docs
 

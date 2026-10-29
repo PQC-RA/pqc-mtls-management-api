@@ -23,9 +23,37 @@ jobs:
   node:
     name: typecheck · lint · test
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      # The ADR-022 suites sign their ML-DSA-65 fixtures with the OpenSSL CLI
+      # (Node 22 cannot sign ML-DSA), and Ubuntu 24.04 ships OpenSSL 3.0. Take
+      # the PQ OpenSSL out of the pinned base image this repository already
+      # builds on (base.lock). Without it those suites FAIL, they never skip.
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: PQ OpenSSL for the test fixtures
+        run: |
+          set -euo pipefail
+          ref="$(jq -er '.image' base.lock)@$(jq -er '.digest' base.lock)"
+          docker pull --quiet "$ref"
+          id=$(docker create "$ref" /bin/true)
+          mkdir -p "$RUNNER_TEMP/pq-opt"
+          docker cp "$id:/opt/." "$RUNNER_TEMP/pq-opt/"
+          docker rm "$id" >/dev/null
+          bin=$(find "$RUNNER_TEMP/pq-opt" -path '*/bin/openssl' -type f | sort | tail -1)
+          root=$(dirname "$(dirname "$bin")")
+          LD_LIBRARY_PATH="$root/lib64:$root/lib" OPENSSL_CONF=/dev/null "$bin" version
+          echo "PQC_TEST_OPENSSL=$bin" >> "$GITHUB_ENV"
 
       # Version comes from package.json's packageManager field, so the runner
       # resolves the same pnpm the lockfile was written under.
