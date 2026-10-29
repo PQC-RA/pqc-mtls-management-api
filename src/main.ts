@@ -8,9 +8,11 @@ import { NestExpressApplication } from "@nestjs/platform-express";
 import { DocumentBuilder, SwaggerModule } from "@nestjs/swagger";
 
 import { AppModule } from "@/app.module";
+import { checkEnrollmentProfileConfig } from "@/certs/certs.controller";
 import { HttpExceptionFilter } from "@/common/filters/http-exception.filter";
 
 async function bootstrap() {
+	const profileWarning = checkEnrollmentProfileConfig();
 	// rawBody: true preserves the exact request bytes on req.rawBody alongside
 	// the normal parsed body. Needed by EnrollHmacGuard, which must HMAC the
 	// same bytes the gateway signed -- a re-serialized JSON.stringify(body)
@@ -19,6 +21,7 @@ async function bootstrap() {
 		rawBody: true,
 	});
 	const logger = new Logger("Bootstrap");
+	if (profileWarning) logger.warn(profileWarning);
 
 	// Lock CORS to an explicit allowlist.  Set CORS_ALLOWED_ORIGINS to a
 	// comma-separated list of permitted origins (e.g. "https://admin.example.com").

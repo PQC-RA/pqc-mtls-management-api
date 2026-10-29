@@ -83,6 +83,24 @@ export function resolveEnrollmentProfile(
 }
 
 /**
+ * Startup check of DEFAULT_ENROLLMENT_PROFILE, so a typo stops the service at boot instead of
+ * failing the first token request. Returns a warning when client-30d is configured but
+ * renewal is off (tokens then stay legacy).
+ */
+export function checkEnrollmentProfileConfig(): string | undefined {
+	const def = (process.env.DEFAULT_ENROLLMENT_PROFILE ?? "").trim();
+	if (def !== "" && def !== "legacy" && def !== "client-30d") {
+		throw new Error(
+			`DEFAULT_ENROLLMENT_PROFILE=${def} is invalid: use client-30d or legacy`
+		);
+	}
+	if (def === "client-30d" && process.env.RENEWAL_ENABLED !== "1") {
+		return "DEFAULT_ENROLLMENT_PROFILE=client-30d has no effect while RENEWAL_ENABLED is not 1; tokens stay legacy";
+	}
+	return undefined;
+}
+
+/**
  * DTO for validating the :serial path parameter.
  * The global ValidationPipe applies class-validator decorators to @Param() objects.
  */
@@ -161,7 +179,11 @@ export class CertsController {
 		params: c => ({
 			cn: c.query.cn,
 			ttl: c.query.ttl,
-			profile: c.query.profile ?? "default",
+			// The profile the token actually carries, not only what was asked for.
+			profile:
+				(c.result as { profile?: string } | undefined)?.profile ??
+				c.query.profile,
+			requestedProfile: c.query.profile ?? "default",
 			tokenId: tokenId(
 				(c.result as { token?: string } | undefined)?.token
 			),
@@ -197,7 +219,7 @@ export class CertsController {
 		required: false,
 		example: "client-30d",
 		description:
-			"Certificate profile: client-30d (30 days, renewed by the client over mTLS), demo-120s, or legacy (the standard 365-day certificate, not renewable). Renewal profiles are accepted only when renewal is enabled on this deployment. Omitted = the deployment default (DEFAULT_ENROLLMENT_PROFILE, otherwise legacy).",
+			"Certificate profile: client-30d (30 days, renewed by the client over mTLS), demo-120s, or legacy (the CERT_VALIDITY_DAYS certificate, 365 days by default, not renewable). Renewal profiles are accepted only when renewal is enabled on this deployment. Omitted = the deployment default (DEFAULT_ENROLLMENT_PROFILE, otherwise legacy).",
 	})
 	async createEnrollmentToken(
 		@Query("cn") cn: string,
@@ -215,7 +237,6 @@ export class CertsController {
 				HttpStatus.BAD_REQUEST
 			);
 		}
-		const effective = resolveEnrollmentProfile(profile);
 		if (!cn || cn.trim() === "") {
 			throw new HttpException(
 				"cn query parameter is required – specify the CN the CSR must contain",
@@ -226,13 +247,14 @@ export class CertsController {
 		if (!CN_PATTERN.test(allowedCn)) {
 			throw new BadRequestException("cn must match [A-Za-z0-9._-]{1,64}");
 		}
+		const effective = resolveEnrollmentProfile(profile);
 		const expiresAt = Date.now() + ttl * 1000;
 		const token = await this.certsService.createEnrollmentToken(
 			ttl,
 			allowedCn,
 			effective
 		);
-		return { token, expiresAt, allowedCn };
+		return { token, expiresAt, allowedCn, profile: effective ?? "legacy" };
 	}
 
 	@Get("enrollment-tokens")

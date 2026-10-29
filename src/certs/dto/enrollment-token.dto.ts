@@ -31,6 +31,14 @@ export class EnrollmentTokenDto {
 		example: "my-service",
 	})
 	allowedCn: string;
+
+	@ApiProperty({
+		description:
+			"Profile the certificate will be issued under: client-30d (renewable 30-day), demo-120s, or legacy (the CERT_VALIDITY_DAYS certificate, 365 days by default, not renewable). Shows the deployment default when no profile was requested.",
+		enum: ["client-30d", "demo-120s", "legacy"],
+		example: "client-30d",
+	})
+	profile: "client-30d" | "demo-120s" | "legacy";
 }
 
 /**

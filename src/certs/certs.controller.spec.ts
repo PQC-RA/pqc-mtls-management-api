@@ -8,7 +8,10 @@ jest.mock("@/common/guards/jwt-auth.guard", () => ({
 
 import { Test, TestingModule } from "@nestjs/testing";
 
-import { CertsController } from "@/certs/certs.controller";
+import {
+	CertsController,
+	checkEnrollmentProfileConfig,
+} from "@/certs/certs.controller";
 import { CertsService } from "@/certs/certs.service";
 import { RevocationReason } from "@/certs/dto/revoke-cert.dto";
 import { JwtAuthGuard } from "@/common/guards/jwt-auth.guard";
@@ -178,6 +181,54 @@ describe("CertsController", () => {
 					"client-90d"
 				)
 			).rejects.toMatchObject({ status: 400 });
+		});
+
+		it("the response names the effective profile", async () => {
+			process.env.DEFAULT_ENROLLMENT_PROFILE = "client-30d";
+			process.env.RENEWAL_ENABLED = "1";
+			certsService.createEnrollmentToken.mockResolvedValue("enroll_xyz");
+			const a = await controller.createEnrollmentToken(
+				"my-service",
+				3600
+			);
+			expect(a.profile).toBe("client-30d");
+			const b = await controller.createEnrollmentToken(
+				"my-service",
+				3600,
+				"legacy"
+			);
+			expect(b.profile).toBe("legacy");
+		});
+
+		it("a whitespace or legacy default stays legacy", async () => {
+			process.env.RENEWAL_ENABLED = "1";
+			process.env.DEFAULT_ENROLLMENT_PROFILE = "  ";
+			expect(await created()).toBeUndefined();
+			process.env.DEFAULT_ENROLLMENT_PROFILE = "legacy";
+			expect(await created()).toBeUndefined();
+		});
+
+		it("explicit client-30d with renewal off reaches the service (which refuses), no silent downgrade", async () => {
+			process.env.DEFAULT_ENROLLMENT_PROFILE = "client-30d";
+			delete process.env.RENEWAL_ENABLED;
+			expect(await created("client-30d")).toBe("client-30d");
+		});
+
+		it("a missing cn is still a 400 even with an invalid default", async () => {
+			process.env.DEFAULT_ENROLLMENT_PROFILE = "bogus";
+			await expect(
+				controller.createEnrollmentToken("", 3600)
+			).rejects.toMatchObject({ status: 400 });
+		});
+
+		it("startup check: invalid default throws, client-30d without renewal warns", () => {
+			process.env.DEFAULT_ENROLLMENT_PROFILE = "client-30D";
+			expect(() => checkEnrollmentProfileConfig()).toThrow(/invalid/);
+			process.env.DEFAULT_ENROLLMENT_PROFILE = "client-30d";
+			delete process.env.RENEWAL_ENABLED;
+			expect(checkEnrollmentProfileConfig()).toMatch(/no effect/);
+			process.env.RENEWAL_ENABLED = "1";
+			expect(checkEnrollmentProfileConfig()).toBeUndefined();
 		});
 
 		it("an invalid default is a loud 500, never a silent fallback", async () => {
