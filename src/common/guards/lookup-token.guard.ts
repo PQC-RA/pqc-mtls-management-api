@@ -14,6 +14,7 @@ import * as jwt from "jsonwebtoken";
 import jwksRsa, { JwksClient } from "jwks-rsa";
 
 import { normalizeFingerprint, SHA256_HEX } from "@/common/auth/cert-roles";
+import { gatewayHttpsAgent } from "@/common/auth/gateway-tls";
 
 /**
  * LookupTokenGuard – verifies Token 2 (the gateway's cert-lookup JWT, minted
@@ -61,15 +62,41 @@ export type RequestWithLookupFpr = Request & { lookupFpr?: string };
 export class LookupTokenGuard implements CanActivate {
 	private readonly logger = new Logger(LookupTokenGuard.name);
 
-	private readonly jwksClient: JwksClient = jwksRsa({
-		jwksUri: JWKS_URI,
-		cache: true,
-		cacheMaxEntries: 5,
-		cacheMaxAge: 60 * 60 * 1000, // 1 hour
-		timeout: 5_000,
-		rateLimit: true,
-		jwksRequestsPerMinute: 10,
-	});
+	private readonly jwksClient: JwksClient;
+
+	/**
+	 * Set when GATEWAY_TLS_LEAF_ALG asks for a leaf type that cannot be
+	 * enforced (plain-http JWKS URI): every lookup is then refused rather than
+	 * fetched without the check.
+	 */
+	private readonly leafAlgMisconfigured?: string;
+
+	constructor() {
+		// GATEWAY_TLS_LEAF_ALG (ADR-022): the same :8081 leaf-type check as the
+		// admin token's JWKS fetch (JwtAuthGuard) and the route push, so none of
+		// the three channels accepts an RSA leaf the pinned CA signed.
+		const leafAlg = process.env.GATEWAY_TLS_LEAF_ALG || undefined;
+		const isHttps = JWKS_URI.startsWith("https://");
+		if (leafAlg && !isHttps) {
+			this.leafAlgMisconfigured =
+				"GATEWAY_TLS_LEAF_ALG is set but GATEWAY_JWKS_URI is not https";
+			this.logger.error(
+				`${this.leafAlgMisconfigured}: every cert lookup will be refused`
+			);
+		}
+		this.jwksClient = jwksRsa({
+			jwksUri: JWKS_URI,
+			cache: true,
+			cacheMaxEntries: 5,
+			cacheMaxAge: 60 * 60 * 1000, // 1 hour
+			timeout: 5_000,
+			rateLimit: true,
+			jwksRequestsPerMinute: 10,
+			...(leafAlg && isHttps
+				? { requestAgent: gatewayHttpsAgent(leafAlg) }
+				: {}),
+		});
+	}
 
 	async canActivate(context: ExecutionContext): Promise<boolean> {
 		const request = context
@@ -113,6 +140,9 @@ export class LookupTokenGuard implements CanActivate {
 		}
 
 		// 4. Fetch the matching public key from the gateway JWKS.
+		if (this.leafAlgMisconfigured) {
+			throw new UnauthorizedException("Unable to verify token");
+		}
 		let publicKey: string;
 		try {
 			const key = await this.jwksClient.getSigningKey(decodedHeader.kid);

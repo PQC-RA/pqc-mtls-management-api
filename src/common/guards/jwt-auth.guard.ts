@@ -62,6 +62,8 @@ import { IS_PUBLIC_KEY } from "@/common/decorators/public.decorator";
  *   GATEWAY_TLS_LEAF_ALG  "ML-DSA-65": the JWKS is fetched only from a :8081
  *                         presenting an ML-DSA-65 certificate (unset: any leaf
  *                         that chains to NODE_EXTRA_CA_CERTS, for the cut-over).
+ *                         LookupTokenGuard and the route push apply the same
+ *                         check (common/auth/gateway-tls.ts).
  *   JWT_EXPECTED_ISSUER / JWT_EXPECTED_AUDIENCE, GATEWAY_JWKS_URI.
  *
  * Security posture:

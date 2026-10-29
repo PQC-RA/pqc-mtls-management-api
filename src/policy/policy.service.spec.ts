@@ -1,9 +1,11 @@
 jest.mock("fs");
 import * as fs from "fs";
+import * as https from "https";
 
-import { HttpStatus } from "@nestjs/common";
+import { BadGatewayException, HttpStatus } from "@nestjs/common";
 import { Test, TestingModule } from "@nestjs/testing";
 
+import * as gatewayTls from "@/common/auth/gateway-tls";
 import { PolicyService } from "@/policy/policy.service";
 
 const existsSync = jest.mocked(fs.existsSync);
@@ -748,5 +750,100 @@ describe("PolicyService", () => {
 			const result = await service.dryRunRoutes(snapshotBeforeOrgChange);
 			expect(result.diff.changedClients).toContain("service-C");
 		});
+	});
+});
+
+// ── ADR-022: the :8081 leaf type on the route push ─────────────────────────
+describe("PolicyService route push with GATEWAY_TLS_LEAF_ALG", () => {
+	const saved = {
+		leaf: process.env.GATEWAY_TLS_LEAF_ALG,
+		url: process.env.GATEWAY_CONTROL_URL,
+	};
+	async function make(): Promise<PolicyService> {
+		const module: TestingModule = await Test.createTestingModule({
+			providers: [PolicyService],
+		}).compile();
+		return module.get<PolicyService>(PolicyService);
+	}
+	const push = (s: PolicyService) =>
+		(
+			s as unknown as {
+				pushRoutesToGateway(r: unknown): Promise<void>;
+			}
+		).pushRoutesToGateway(SAMPLE_ROUTES);
+
+	beforeEach(() => {
+		jest.resetAllMocks();
+		(global as typeof globalThis & { fetch: typeof fetch }).fetch =
+			fetchMock as unknown as typeof fetch;
+		readFileSync.mockImplementation((p: fs.PathLike) =>
+			p === HMAC_SECRET_FILE ? "test-hmac-secret" : (undefined as never)
+		);
+		existsSync.mockReturnValue(false);
+	});
+	afterEach(() => {
+		jest.restoreAllMocks();
+		for (const [k, v] of [
+			["GATEWAY_TLS_LEAF_ALG", saved.leaf],
+			["GATEWAY_CONTROL_URL", saved.url],
+		] as const) {
+			if (v === undefined) delete process.env[k];
+			else process.env[k] = v;
+		}
+	});
+
+	it("pushes through the leaf-checking https agent, not fetch", async () => {
+		process.env.GATEWAY_TLS_LEAF_ALG = "ML-DSA-65";
+		process.env.GATEWAY_CONTROL_URL = "https://gateway:8081/update-routes";
+		const post = jest
+			.spyOn(gatewayTls, "gatewayHttpsPost")
+			.mockResolvedValue({
+				ok: true,
+				status: 200,
+				text: async () => '{"ok":true}',
+			});
+		await push(await make());
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(post).toHaveBeenCalledTimes(1);
+		const [url, headers, body, agent] = post.mock.calls[0];
+		expect(url).toBe("https://gateway:8081/update-routes");
+		expect(headers["X-Hub-Signature-256"]).toMatch(/^sha256=[0-9a-f]{64}$/);
+		expect(JSON.parse(body)).toMatchObject(SAMPLE_ROUTES);
+		expect(agent).toBeInstanceOf(https.Agent);
+	});
+
+	it("maps a refused :8081 leaf to 502", async () => {
+		process.env.GATEWAY_TLS_LEAF_ALG = "ML-DSA-65";
+		process.env.GATEWAY_CONTROL_URL = "https://gateway:8081/update-routes";
+		jest.spyOn(gatewayTls, "gatewayHttpsPost").mockRejectedValue(
+			new Error("the :8081 certificate is not an ML-DSA-65 certificate")
+		);
+		await expect(push(await make())).rejects.toBeInstanceOf(
+			BadGatewayException
+		);
+	});
+
+	it("refuses to push over plain http when a leaf type is required", async () => {
+		process.env.GATEWAY_TLS_LEAF_ALG = "ML-DSA-65";
+		process.env.GATEWAY_CONTROL_URL = "http://gateway:8081/update-routes";
+		const post = jest.spyOn(gatewayTls, "gatewayHttpsPost");
+		await expect(push(await make())).rejects.toBeInstanceOf(
+			BadGatewayException
+		);
+		expect(post).not.toHaveBeenCalled();
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("without a leaf type, pushes with fetch as before", async () => {
+		delete process.env.GATEWAY_TLS_LEAF_ALG;
+		fetchMock.mockResolvedValue({
+			ok: true,
+			status: 200,
+			text: async () => '{"ok":true}',
+		});
+		const post = jest.spyOn(gatewayTls, "gatewayHttpsPost");
+		await push(await make());
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(post).not.toHaveBeenCalled();
 	});
 });

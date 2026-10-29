@@ -40,7 +40,13 @@ Node JOSE library implements RFC 9964):
 
 The token crosses the gateway-to-API hop in plain HTTP inside the Docker
 network; `jti` and `htm`/`htu` limit what an observer on that hop can do with
-one (no replay, no other route), TLS on that hop is later work.
+one (no replay, no other route), TLS on that hop is later work. Two limits:
+- the `jti` cache lives in this process's memory, so a restart empties it: a
+  token captured on that hop less than 60 s before a restart can be replayed
+  once after it;
+- `admin-v1` tokens are accepted without `jti`, `htm` and `htu` (checked when
+  present), so a gateway rolled back to code from before ADR-022 keeps working
+  during the dual window. `JWT_EXPECTED_KID=admin-v2` ends that.
 
 ### Role-based access control (RBAC)
 
@@ -158,11 +164,11 @@ See `.env.example` for the full annotated list. Key variables:
 | `GATEWAY_JWKS_URI` | `http://gateway:8081/.well-known/jwks.json` | gateway JWKS |
 | `JWT_EXPECTED_KID` | `admin-v1` | admin token kids accepted, comma-separated, from the fixed table (`admin-v1`, `admin-v2`). ADR-022 cut-over: `admin-v1,admin-v2` before the gateway switches, `admin-v2` alone after the dual window (48 h on live, ADR-022 amendment 2026-10-29) |
 | `ADMIN_V2_PUB_SHA256` | *(unset → admin-v2 refused)* | SHA-256 (hex) of the admin-v2 raw ML-DSA-65 public key; the gateway's `scripts/generate-gateway-secrets.sh` prints it |
-| `GATEWAY_TLS_LEAF_ALG` | *(unset → any leaf that chains to `NODE_EXTRA_CA_CERTS`)* | `ML-DSA-65`: fetch the JWKS only from a `:8081` presenting an ML-DSA-65 certificate (the end state; an RSA leaf from the pinned CA would otherwise pass) |
+| `GATEWAY_TLS_LEAF_ALG` | *(unset → any leaf that chains to `NODE_EXTRA_CA_CERTS`)* | `ML-DSA-65`: accept only a `:8081` presenting an ML-DSA-65 certificate, on all three channels to it: the admin JWKS fetch, the cert-lookup JWKS fetch (`LookupTokenGuard`) and the route push (the end state; an RSA leaf from a pinned CA would otherwise pass). Needs https URIs; with http ones those calls are refused |
 | `CORS_ALLOWED_ORIGINS` | *(deny)* | comma-separated browser origins |
 | `REDIS_URL` | *(in-memory)* | durable enrollment-token store (required in production) |
 | `PKI_*` path overrides | see `src/common/config/pki.config.ts` | CA directory, OpenSSL binary, CRL and renew-script paths. The defaults match the layout the gateway's compose file mounts |
-| `NODE_EXTRA_CA_CERTS` | *(unset)* | trust anchor for the gateway's internal TLS (an ML-DSA-65 CA from ADR-022; Node 22 validates it). Required for the JWKS fetch to verify; compose sets it to the internal CA. Read only at start |
+| `NODE_EXTRA_CA_CERTS` | *(unset)* | trust anchor for the gateway's internal TLS (an ML-DSA-65 CA from ADR-022; Node 22 validates it). During the ADR-022 move it is a bundle of the ML-DSA-65 and the RSA internal CA, so either `:8081` leaf verifies without a restart. Required for the JWKS fetch to verify; compose sets it to the internal CA file. Read only at start: restart after it changes |
 
 ## API docs
 

@@ -8,7 +8,10 @@
  * admin-v2, as the gateway publishes it. Prints one RESULT line.
  */
 import * as crypto from "crypto";
+import * as fs from "fs";
 import * as http from "http";
+import * as https from "https";
+import * as path from "path";
 
 import * as jwt from "jsonwebtoken";
 
@@ -36,12 +39,39 @@ async function main(): Promise<void> {
 			entry("lookup-v1"),
 		],
 	});
-	const server = http.createServer((_q, r) => {
+	// LOOKUP_TLS (ADR-022 L2, the :8081 leaf check on this channel):
+	//   unset                 plain http JWKS on loopback (default)
+	//   node:<crt>:<key>      Node https server with this (RSA) certificate
+	//   docroot:<dir>:<url>   the JWKS written to <dir>/jwks.json, fetched from
+	//                         <url> (an OpenSSL s_server -WWW with an ML-DSA-65
+	//                         certificate, started by the spec: Node cannot sign
+	//                         ML-DSA)
+	// Trust comes from NODE_EXTRA_CA_CERTS, as in production.
+	const mode = (process.env.LOOKUP_TLS ?? "").split(":");
+	const handler: http.RequestListener = (_q, r) => {
 		r.writeHead(200, { "content-type": "application/json" });
 		r.end(jwks);
-	});
-	await new Promise<void>(res => server.listen(0, "127.0.0.1", () => res()));
-	process.env.GATEWAY_JWKS_URI = `http://127.0.0.1:${(server.address() as { port: number }).port}/jwks.json`;
+	};
+	let server: http.Server | https.Server | undefined;
+	if (mode[0] === "docroot") {
+		fs.writeFileSync(path.join(mode[1], "jwks.json"), jwks);
+		process.env.GATEWAY_JWKS_URI = mode.slice(2).join(":");
+	} else {
+		server =
+			mode[0] === "node"
+				? https.createServer(
+						{
+							cert: fs.readFileSync(mode[1]),
+							key: fs.readFileSync(mode[2]),
+						},
+						handler
+					)
+				: http.createServer(handler);
+		const s = server;
+		await new Promise<void>(res => s.listen(0, "127.0.0.1", () => res()));
+		const scheme = mode[0] === "node" ? "https" : "http";
+		process.env.GATEWAY_JWKS_URI = `${scheme}://127.0.0.1:${(s.address() as { port: number }).port}/jwks.json`;
+	}
 
 	// Loaded only now: the guard reads GATEWAY_JWKS_URI at module load.
 	// eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -69,11 +99,14 @@ async function main(): Promise<void> {
 	} catch (e) {
 		lookup = `FAIL ${(e as Error).message}`;
 	}
-	server.close();
+	server?.close();
 	console.log(`RESULT lookup=${lookup}`);
 }
 
-main().catch(e => {
-	console.log(`RESULT lookup=FAIL ${(e as Error).message}`);
-	process.exit(1);
-});
+main().then(
+	() => process.exit(0),
+	e => {
+		console.log(`RESULT lookup=FAIL ${(e as Error).message}`);
+		process.exit(1);
+	}
+);

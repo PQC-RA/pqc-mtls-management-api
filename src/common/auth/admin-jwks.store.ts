@@ -1,7 +1,6 @@
 import * as crypto from "crypto";
 import * as http from "http";
 import * as https from "https";
-import * as tls from "tls";
 
 import {
 	AdminJwtError,
@@ -12,6 +11,10 @@ import {
 	MLDSA65_PUB_LENGTH,
 	MLDSA65_SPKI_PREFIX,
 } from "@/common/auth/admin-jwt.verifier";
+import {
+	gatewayLeafCheck,
+	SUPPORTED_LEAF_ALGS,
+} from "@/common/auth/gateway-tls";
 import {
 	isJsonObject,
 	JsonValue,
@@ -153,24 +156,6 @@ export interface JwksFetchOptions {
 	ca?: string | Buffer;
 }
 
-/** True if a DER certificate's public key is an ML-DSA-65 key. */
-export function isMldsa65Certificate(raw: Buffer): boolean {
-	try {
-		const spki = new crypto.X509Certificate(raw).publicKey.export({
-			format: "der",
-			type: "spki",
-		});
-		return (
-			spki.length === MLDSA65_SPKI_PREFIX.length + MLDSA65_PUB_LENGTH &&
-			spki
-				.subarray(0, MLDSA65_SPKI_PREFIX.length)
-				.equals(MLDSA65_SPKI_PREFIX)
-		);
-	} catch {
-		return false;
-	}
-}
-
 /** GET with a timeout and a hard body cap; http or https (NODE_EXTRA_CA_CERTS applies). */
 export function makeJwksFetcher(fo: JwksFetchOptions = {}): JwksFetcher {
 	return (uri, maxBytes) =>
@@ -180,7 +165,7 @@ export function makeJwksFetcher(fo: JwksFetchOptions = {}): JwksFetcher {
 			if (isHttps) {
 				if (fo.ca) options.ca = fo.ca;
 				if (fo.leafAlg) {
-					if (fo.leafAlg !== "ML-DSA-65") {
+					if (!SUPPORTED_LEAF_ALGS.includes(fo.leafAlg)) {
 						reject(
 							new Error(
 								`unsupported GATEWAY_TLS_LEAF_ALG ${fo.leafAlg}`
@@ -188,16 +173,7 @@ export function makeJwksFetcher(fo: JwksFetchOptions = {}): JwksFetcher {
 						);
 						return;
 					}
-					options.checkServerIdentity = (host, cert) => {
-						const err = tls.checkServerIdentity(host, cert);
-						if (err) return err;
-						if (!isMldsa65Certificate(cert.raw)) {
-							return new Error(
-								"the :8081 certificate is not an ML-DSA-65 certificate"
-							);
-						}
-						return undefined;
-					};
+					options.checkServerIdentity = gatewayLeafCheck(fo.leafAlg);
 				}
 			} else if (fo.leafAlg) {
 				reject(

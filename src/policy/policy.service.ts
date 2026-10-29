@@ -12,6 +12,7 @@ import {
 } from "@nestjs/common";
 import Redis from "ioredis";
 
+import { gatewayHttpsAgent, gatewayHttpsPost } from "@/common/auth/gateway-tls";
 import { PKI_CONFIG } from "@/common/config/pki.config";
 import {
 	ClientPolicyDto,
@@ -47,6 +48,14 @@ export class PolicyService implements OnModuleInit, OnModuleDestroy {
 	private readonly routesFilePath = PKI_CONFIG.routesFilePath;
 	private readonly gatewayControlUrl =
 		process.env.GATEWAY_CONTROL_URL ?? "http://gateway:8081/update-routes";
+	/**
+	 * GATEWAY_TLS_LEAF_ALG (ADR-022): the route push accepts only a :8081 leaf
+	 * of this type, as the JWKS fetches do. fetch cannot take an https.Agent,
+	 * so with a leaf type set the push goes through gatewayHttpsPost.
+	 */
+	private readonly gatewayTlsLeafAlg =
+		process.env.GATEWAY_TLS_LEAF_ALG || undefined;
+	private readonly gatewayAgent = gatewayHttpsAgent(this.gatewayTlsLeafAlg);
 
 	private readonly redis: Redis | null = null;
 	/** In-process fallback store used when REDIS_URL is not configured. */
@@ -542,24 +551,47 @@ export class PolicyService implements OnModuleInit, OnModuleDestroy {
 				.update(signedString)
 				.digest("hex");
 
-		const response = await fetch(this.gatewayControlUrl, {
-			method,
-			headers: {
-				"Content-Type": "application/json",
-				"Accept": "application/json",
-				"X-Timestamp": timestamp,
-				"X-Hub-Signature-256": sig,
-			},
-			body,
-			signal: AbortSignal.timeout(10_000),
-		}).catch((error: unknown) => {
+		const headers = {
+			"Content-Type": "application/json",
+			"Accept": "application/json",
+			"X-Timestamp": timestamp,
+			"X-Hub-Signature-256": sig,
+		};
+		const failed = (error: unknown): never => {
 			const message =
 				error instanceof Error ? error.message : String(error);
 			this.logger.error(`Gateway control-plane call failed: ${message}`);
 			throw new BadGatewayException(
 				"Failed to contact gateway control plane"
 			);
-		});
+		};
+		let response: { ok: boolean; status: number; text(): Promise<string> };
+		if (this.gatewayTlsLeafAlg) {
+			if (
+				!this.gatewayAgent ||
+				!this.gatewayControlUrl.startsWith("https://")
+			) {
+				this.logger.error(
+					"GATEWAY_TLS_LEAF_ALG is set but GATEWAY_CONTROL_URL is not https: refusing to push routes"
+				);
+				throw new BadGatewayException(
+					"Failed to contact gateway control plane"
+				);
+			}
+			response = await gatewayHttpsPost(
+				this.gatewayControlUrl,
+				headers,
+				body,
+				this.gatewayAgent
+			).catch(failed);
+		} else {
+			response = await fetch(this.gatewayControlUrl, {
+				method,
+				headers,
+				body,
+				signal: AbortSignal.timeout(10_000),
+			}).catch(failed);
+		}
 
 		if (!response.ok) {
 			const bodyText = await response.text().catch(() => "");
