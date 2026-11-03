@@ -92,7 +92,7 @@ describe("ca-custodian.util", () => {
 		);
 	});
 
-	it.each(["not_ready", "stopping"])(
+	it.each(["not_ready", "stopping", "busy", "crl_failed"])(
 		"turns the custodian's 503 %s into a retryable 503, nothing sent",
 		async code => {
 			global.fetch = custodianAnswer(503, {
@@ -173,13 +173,50 @@ describe("ca-custodian.util", () => {
 			await expect(issueCrlViaCustodian(logger)).resolves.toBeNull();
 		});
 
+		it("issueCrlViaCustodian: a failed CRL pass (503 crl_failed) is a retryable 503, not a 502", async () => {
+			// custodian.js answers /crl/issue with exactly this when the pass fails.
+			global.fetch = custodianAnswer(503, {
+				error: "crl_failed",
+				message: "CRL not published: openssl failed; retry",
+			});
+			const err = await issueCrlViaCustodian(logger).catch(e => e);
+			expect(err).toBeInstanceOf(CustodianHttpException);
+			expect((err as CustodianHttpException).getStatus()).toBe(
+				HttpStatus.SERVICE_UNAVAILABLE
+			);
+			expect((err as CustodianHttpException).code).toBe("crl_failed");
+		});
+
+		it("a sign behind a busy CA (503 busy) is a retryable 503, safe to release", async () => {
+			global.fetch = custodianAnswer(503, {
+				error: "busy",
+				message: "The CA is busy; nothing was signed; retry",
+			});
+			const err = await signCsrViaCustodian(logger, "csr").catch(e => e);
+			expect((err as CustodianHttpException).kind).toBe("not_sent");
+			expect((err as CustodianHttpException).getStatus()).toBe(
+				HttpStatus.SERVICE_UNAVAILABLE
+			);
+		});
+
+		it("a 503 the custodian does not send stays a 502, ambiguous", async () => {
+			global.fetch = custodianAnswer(503, { error: "unknown_503" });
+			const err = await signCsrViaCustodian(logger, "csr").catch(e => e);
+			expect((err as CustodianHttpException).kind).toBe("ambiguous");
+			expect((err as CustodianHttpException).getStatus()).toBe(
+				HttpStatus.BAD_GATEWAY
+			);
+		});
+
 		it("issueCrlViaCustodian does not hide other errors", async () => {
 			global.fetch = custodianAnswer(500, {
-				error: "crl_failed",
+				error: "internal",
 				message: "no",
 			});
-			await expect(issueCrlViaCustodian(logger)).rejects.toBeInstanceOf(
-				CustodianHttpException
+			const err = await issueCrlViaCustodian(logger).catch(e => e);
+			expect(err).toBeInstanceOf(CustodianHttpException);
+			expect((err as CustodianHttpException).getStatus()).toBe(
+				HttpStatus.BAD_GATEWAY
 			);
 		});
 	});

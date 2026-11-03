@@ -38,7 +38,9 @@ function getCustodianHmacSecret(): string {
  * How a failed custodian call must be treated by a caller that holds a
  * reservation:
  *   refused   the custodian answered and did not sign (safe to release)
- *   not_sent  the request never reached the custodian (safe to release)
+ *   not_sent  the custodian did nothing: the request never reached it, or it
+ *             refused before acting with one of its retryable 503s (safe to
+ *             release)
  *   ambiguous the custodian may have signed (reconcile before releasing)
  */
 export type CustodianErrorKind = "refused" | "not_sent" | "ambiguous";
@@ -54,6 +56,19 @@ export class CustodianHttpException extends HttpException {
 		super(message, status);
 	}
 }
+
+/**
+ * The custodian's own retryable 503s. Each means nothing was signed or
+ * revoked: stopping (shutting down), not_ready (no first CRL yet, ADR-024),
+ * busy (the CA was not free within its mutex wait), crl_failed (/crl/issue:
+ * the CRL pass failed or ran past its deadline). Any other 503 stays a 502.
+ */
+const RETRYABLE_503_CODES = new Set([
+	"stopping",
+	"not_ready",
+	"busy",
+	"crl_failed",
+]);
 
 const NOT_SENT_CODES = new Set([
 	"ENOTFOUND",
@@ -183,12 +198,12 @@ async function custodianRequest<T>(
 	if (!response.ok) {
 		const code =
 			typeof payload.error === "string" ? payload.error : undefined;
-		// The custodian refused before doing anything: it is stopping, or (as
-		// the CRL issuer, ADR-024) has not published its first CRL yet. Nothing
-		// was signed or revoked; retry later.
+		// The custodian refused before doing anything (RETRYABLE_503_CODES).
+		// Nothing was signed or revoked; retry later.
 		if (
 			response.status === 503 &&
-			(code === "stopping" || code === "not_ready")
+			code !== undefined &&
+			RETRYABLE_503_CODES.has(code)
 		) {
 			throw new CustodianHttpException(
 				payload.message ?? "CA custodian is not ready",
