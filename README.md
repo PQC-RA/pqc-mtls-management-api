@@ -179,3 +179,10 @@ Swagger UI is served at `/api/docs` when the app is running.
 - No secrets are committed. PKI/keys are mounted from the host at runtime.
 - In production, set `REDIS_URL` (the in-memory token store refuses to start
   under `NODE_ENV=production` because single-use is not durable/cross-instance).
+
+## Contributing
+
+Every contribution, by a person or an AI agent, follows the project's engineering rules in the
+gateway repository,
+[ENGINEERING-RULES.md](https://github.com/PQC-RA/pqc-mtls-gateway/blob/main/ENGINEERING-RULES.md).
+Pull requests answer the checklist at its end.
