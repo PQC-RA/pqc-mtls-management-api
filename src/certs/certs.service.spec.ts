@@ -153,6 +153,44 @@ describe("CertsService", () => {
 				status: HttpStatus.INTERNAL_SERVER_ERROR,
 			});
 		});
+
+		it("passes a stopped custodian through as a retryable 503, not a 500 (ADR-024)", async () => {
+			jest.spyOn(
+				caCustodianUtil,
+				"fetchIndexViaCustodian"
+			).mockRejectedValueOnce(
+				new caCustodianUtil.CustodianHttpException(
+					"CA custodian is unavailable",
+					HttpStatus.SERVICE_UNAVAILABLE,
+					"not_sent",
+					"ENOTFOUND"
+				)
+			);
+			await expect(service.getAllCertificates()).rejects.toMatchObject({
+				status: HttpStatus.SERVICE_UNAVAILABLE,
+			});
+		});
+
+		it("and a revoke that must first read the index answers 503 too", async () => {
+			jest.spyOn(
+				caCustodianUtil,
+				"fetchIndexViaCustodian"
+			).mockRejectedValueOnce(
+				new caCustodianUtil.CustodianHttpException(
+					"CA custodian is unavailable",
+					HttpStatus.SERVICE_UNAVAILABLE,
+					"not_sent",
+					"ENOTFOUND"
+				)
+			);
+			await expect(
+				service.revokeCertificate(
+					"1006",
+					"keyCompromise",
+					"ab".repeat(32)
+				)
+			).rejects.toMatchObject({ status: HttpStatus.SERVICE_UNAVAILABLE });
+		});
 	});
 
 	// ── getExpiringCertificates ──────────────────────────────────────────────────

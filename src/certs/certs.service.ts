@@ -463,6 +463,15 @@ export class CertsService implements OnModuleInit, OnModuleDestroy {
 			fs.writeFileSync(tmpPath, content, { mode: 0o600 });
 			return await this.indexParser.parseIndexFile(tmpPath);
 		} catch (error) {
+			// The custodian's own error is already precise: 503 when it is
+			// down or not ready (retryable), 502 when the answer is unusable.
+			// Only a failure to parse what it sent is our 500.
+			if (error instanceof CustodianHttpException) {
+				this.logger.error(
+					`Could not read the CA index: ${error.message}`
+				);
+				throw error;
+			}
 			this.logger.error(`Failed to parse index file: ${error.message}`);
 			throw new HttpException(
 				"Internal Server Error while parsing PKI database",
