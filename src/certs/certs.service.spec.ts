@@ -87,7 +87,7 @@ describe("CertsService", () => {
 			caCustodianUtil,
 			"fetchIssuedPemViaCustodian"
 		).mockResolvedValue(FAKE_CERT_PEM);
-		jest.spyOn(caCustodianUtil, "revokeViaCustodian").mockResolvedValue();
+		jest.spyOn(caCustodianUtil, "revokeViaCustodian").mockResolvedValue({});
 		jest.spyOn(caCustodianUtil, "signCsrViaCustodian").mockResolvedValue({
 			certificate: FAKE_CERT_PEM,
 			serialNumber: "1007",
@@ -152,6 +152,44 @@ describe("CertsService", () => {
 			await expect(service.getAllCertificates()).rejects.toMatchObject({
 				status: HttpStatus.INTERNAL_SERVER_ERROR,
 			});
+		});
+
+		it("passes a stopped custodian through as a retryable 503, not a 500 (ADR-024)", async () => {
+			jest.spyOn(
+				caCustodianUtil,
+				"fetchIndexViaCustodian"
+			).mockRejectedValueOnce(
+				new caCustodianUtil.CustodianHttpException(
+					"CA custodian is unavailable",
+					HttpStatus.SERVICE_UNAVAILABLE,
+					"not_sent",
+					"ENOTFOUND"
+				)
+			);
+			await expect(service.getAllCertificates()).rejects.toMatchObject({
+				status: HttpStatus.SERVICE_UNAVAILABLE,
+			});
+		});
+
+		it("and a revoke that must first read the index answers 503 too", async () => {
+			jest.spyOn(
+				caCustodianUtil,
+				"fetchIndexViaCustodian"
+			).mockRejectedValueOnce(
+				new caCustodianUtil.CustodianHttpException(
+					"CA custodian is unavailable",
+					HttpStatus.SERVICE_UNAVAILABLE,
+					"not_sent",
+					"ENOTFOUND"
+				)
+			);
+			await expect(
+				service.revokeCertificate(
+					"1006",
+					"keyCompromise",
+					"ab".repeat(32)
+				)
+			).rejects.toMatchObject({ status: HttpStatus.SERVICE_UNAVAILABLE });
 		});
 	});
 
@@ -1006,7 +1044,7 @@ describe("CertsService", () => {
 			] as never);
 			const revoke = jest
 				.spyOn(caCustodianUtil, "revokeViaCustodian")
-				.mockResolvedValue();
+				.mockResolvedValue({});
 
 			await service.revokeCertificate(
 				"1006",
@@ -1023,6 +1061,39 @@ describe("CertsService", () => {
 			);
 		});
 
+		it.each([
+			["published", /published a CRL carrying it/],
+			["pending", /keeps retrying/],
+		] as const)(
+			"the custodian as CRL issuer (ADR-024) answered %s: no renewer signal, and the answer says so",
+			async (crl, message) => {
+				indexParser.parseIndexFile.mockResolvedValue([
+					makeCert("V", 90, "1006"),
+				] as never);
+				jest.spyOn(
+					caCustodianUtil,
+					"revokeViaCustodian"
+				).mockResolvedValue({
+					crl,
+					crlNumber: crl === "published" ? "0x10" : undefined,
+				});
+				const write = jest.mocked(fs.writeFileSync);
+				write.mockClear();
+				const result = await service.revokeCertificate(
+					"1006",
+					"keyCompromise",
+					OTHER_CALLER_FPR
+				);
+				expect(result.crl).toBe(crl);
+				expect(result.message).toMatch(message);
+				expect(write).not.toHaveBeenCalledWith(
+					expect.stringContaining("renew-crl"),
+					expect.anything(),
+					expect.anything()
+				);
+			}
+		);
+
 		it("includes -crl_reason flag for non-unspecified reasons", async () => {
 			indexParser.parseIndexFile.mockResolvedValue([
 				makeCert("V", 90, "1006"),
@@ -1031,7 +1102,7 @@ describe("CertsService", () => {
 
 			const revoke = jest
 				.spyOn(caCustodianUtil, "revokeViaCustodian")
-				.mockResolvedValue();
+				.mockResolvedValue({});
 
 			await service.revokeCertificate(
 				"1006",

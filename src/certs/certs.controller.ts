@@ -12,9 +12,11 @@ import {
 	ParseIntPipe,
 	Post,
 	Query,
+	Res,
 	UseGuards,
 } from "@nestjs/common";
 import {
+	ApiAcceptedResponse,
 	ApiBadRequestResponse,
 	ApiBody,
 	ApiForbiddenResponse,
@@ -23,6 +25,7 @@ import {
 	ApiUnauthorizedResponse,
 } from "@nestjs/swagger";
 import { IsString, Matches } from "class-validator";
+import type { Response } from "express";
 
 import { AuditAction } from "@/admin-audit/decorators/audit-action.decorator";
 import { tokenId } from "@/admin-audit/sanitize.util";
@@ -433,15 +436,30 @@ export class CertsController {
 		type: RevokeCertResponseDto,
 		notFound: "Certificate not found in the CA database",
 	})
+	@ApiAcceptedResponse({
+		description:
+			"The revocation is recorded in the CA database, but no CRL carries it yet: " +
+			"the CA custodian keeps retrying (crl: pending), or the CRL renewer could not be " +
+			"signalled (crl: signal_failed). The revocation stands and cannot be undone; it is " +
+			"refused at the edge once its CRL is published (ADR-024, owner decision 7).",
+		type: RevokeCertResponseDto,
+	})
 	@ApiBody({ type: RevokeCertDto })
 	async revokeCertificate(
 		@Body() dto: RevokeCertDto,
-		@AdminIdentityParam() identity: AdminIdentity
+		@AdminIdentityParam() identity: AdminIdentity,
+		@Res({ passthrough: true }) res: Response
 	): Promise<RevokeCertResponseDto> {
-		return this.certsService.revokeCertificate(
+		const result = await this.certsService.revokeCertificate(
 			dto.serial,
 			dto.reason,
 			identity.fpr
 		);
+		// 202 Accepted end to end when the revocation is recorded but not yet in
+		// a published CRL, as the custodian itself answers (ADR-024 decision 7).
+		if (result.crl === "pending" || result.crl === "signal_failed") {
+			res.status(HttpStatus.ACCEPTED);
+		}
+		return result;
 	}
 }

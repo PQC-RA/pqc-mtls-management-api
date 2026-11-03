@@ -8,6 +8,7 @@ import { AdminAuditService } from "@/admin-audit/admin-audit.service";
 import { CertsService } from "@/certs/certs.service";
 import * as custodian from "@/common/ca-custodian.util";
 import { CustodianHttpException } from "@/common/ca-custodian.util";
+import * as crlSignal from "@/common/crl-signal.util";
 import { RenewService } from "@/renew/renew.service";
 
 jest.mock("@/common/ca-custodian.util", () => {
@@ -23,7 +24,7 @@ jest.mock("@/common/ca-custodian.util", () => {
 	};
 });
 jest.mock("@/common/crl-signal.util", () => ({
-	triggerCrlRegeneration: jest.fn().mockResolvedValue("signaled"),
+	crlAfterRevocation: jest.fn().mockResolvedValue("signaled"),
 }));
 
 // Real ML-DSA-65 material made offline with OpenSSL 3.6.2 (see __fixtures__/README.txt):
@@ -266,6 +267,14 @@ describe("RenewService", () => {
 			"10A1",
 			"keyCompromise"
 		);
+		// The CRL step gets the custodian's two revoke answers (ADR-024).
+		expect(crlSignal.crlAfterRevocation).toHaveBeenCalledWith(
+			expect.anything(),
+			expect.any(Array)
+		);
+		expect(
+			jest.mocked(crlSignal.crlAfterRevocation).mock.calls.at(-1)?.[1]
+		).toHaveLength(2);
 		expect(service.conflicts).toBe(1);
 		expect(fs.readFileSync(alerts, "utf8")).toContain(
 			'"event":"renew.conflict"'

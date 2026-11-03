@@ -38,7 +38,9 @@ function getCustodianHmacSecret(): string {
  * How a failed custodian call must be treated by a caller that holds a
  * reservation:
  *   refused   the custodian answered and did not sign (safe to release)
- *   not_sent  the request never reached the custodian (safe to release)
+ *   not_sent  the custodian did nothing: the request never reached it, or it
+ *             refused before acting with one of its retryable 503s (safe to
+ *             release)
  *   ambiguous the custodian may have signed (reconcile before releasing)
  */
 export type CustodianErrorKind = "refused" | "not_sent" | "ambiguous";
@@ -54,6 +56,19 @@ export class CustodianHttpException extends HttpException {
 		super(message, status);
 	}
 }
+
+/**
+ * The custodian's own retryable 503s. Each means nothing was signed or
+ * revoked: stopping (shutting down), not_ready (no first CRL yet, ADR-024),
+ * busy (the CA was not free within its mutex wait), crl_failed (/crl/issue:
+ * the CRL pass failed or ran past its deadline). Any other 503 stays a 502.
+ */
+const RETRYABLE_503_CODES = new Set([
+	"stopping",
+	"not_ready",
+	"busy",
+	"crl_failed",
+]);
 
 const NOT_SENT_CODES = new Set([
 	"ENOTFOUND",
@@ -120,9 +135,15 @@ async function custodianRequest<T>(
 		logger.error(
 			`CA custodian call failed (${method} ${pathSegment}): ${message} [${code ?? "no code"}, ${kind}]`
 		);
+		// Unreachable (the request never left): the CA is unavailable, a
+		// retryable 503. Possibly delivered: 502, the caller must reconcile.
 		throw new CustodianHttpException(
-			"Failed to contact CA custodian",
-			HttpStatus.BAD_GATEWAY,
+			kind === "not_sent"
+				? "CA custodian is unavailable"
+				: "Failed to contact CA custodian",
+			kind === "not_sent"
+				? HttpStatus.SERVICE_UNAVAILABLE
+				: HttpStatus.BAD_GATEWAY,
 			kind,
 			code
 		);
@@ -177,6 +198,20 @@ async function custodianRequest<T>(
 	if (!response.ok) {
 		const code =
 			typeof payload.error === "string" ? payload.error : undefined;
+		// The custodian refused before doing anything (RETRYABLE_503_CODES).
+		// Nothing was signed or revoked; retry later.
+		if (
+			response.status === 503 &&
+			code !== undefined &&
+			RETRYABLE_503_CODES.has(code)
+		) {
+			throw new CustodianHttpException(
+				payload.message ?? "CA custodian is not ready",
+				HttpStatus.SERVICE_UNAVAILABLE,
+				"not_sent",
+				code
+			);
+		}
 		const mayHaveIssued = payload.mayHaveIssued === true;
 		if (response.status >= 400 && response.status < 500 && !mayHaveIssued) {
 			const status =
@@ -292,15 +327,78 @@ export async function freezeLineageViaCustodian(
 	await custodianRequest(logger, "POST", "/lineage/freeze", { serialNumber });
 }
 
+/**
+ * What the custodian did about the CRL for a revocation. Absent when the
+ * custodian does not issue CRLs (the CRL renewer does): the caller must then
+ * have the renewer regenerate it. With ADR-024's CRL issuer on, "published"
+ * means a CRL carrying the revocation is out (200); "pending" means the
+ * revocation is recorded and the custodian keeps retrying the CRL (202).
+ */
+export interface CustodianRevokeResult {
+	crl?: "published" | "pending";
+	crlNumber?: string;
+}
+
+export const REVOKE_TIMEOUT_MS = 15_000;
+
 export async function revokeViaCustodian(
 	logger: Logger,
 	serialNumber: string,
 	reason?: string
-): Promise<void> {
-	await custodianRequest<{ ok: true }>(logger, "POST", "/revoke", {
-		serialNumber,
-		reason,
-	});
+): Promise<CustodianRevokeResult> {
+	// The custodian answers a revocation within its own deadline (8 s,
+	// REVOKE_CRL_DEADLINE_MS in custodian.js): 200 once the CRL is out, 202 if
+	// it is not by then. This timeout is kept well above that, so a slow CRL
+	// arrives here as a 202, never as a timeout (502, ambiguous).
+	const answer = await custodianRequest<{
+		ok: true;
+		crl?: unknown;
+		crlNumber?: unknown;
+	}>(logger, "POST", "/revoke", { serialNumber, reason }, REVOKE_TIMEOUT_MS);
+	const crl =
+		answer.crl === "published" || answer.crl === "pending"
+			? answer.crl
+			: undefined;
+	return {
+		crl,
+		crlNumber:
+			typeof answer.crlNumber === "string" ? answer.crlNumber : undefined,
+	};
+}
+
+/**
+ * Asks the custodian to issue a CRL now (an operator's forced renewal).
+ * Returns null when the custodian does not issue CRLs: the CRL renewer is
+ * still in place and the caller uses it instead. That answer is 404 in two
+ * forms: `not_crl_issuer` from a custodian that has the endpoint with its CRL
+ * issuer off (ADR-024 PR 2), and `not_found` from one that predates the
+ * endpoint (main before PR 2), so this side works in either deploy order.
+ */
+export async function issueCrlViaCustodian(
+	logger: Logger
+): Promise<{ crlNumber?: string } | null> {
+	try {
+		const answer = await custodianRequest<{ crlNumber?: unknown }>(
+			logger,
+			"POST",
+			"/crl/issue"
+		);
+		return {
+			crlNumber:
+				typeof answer.crlNumber === "string"
+					? answer.crlNumber
+					: undefined,
+		};
+	} catch (error) {
+		if (
+			error instanceof CustodianHttpException &&
+			error.getStatus() === HttpStatus.NOT_FOUND &&
+			(error.code === "not_crl_issuer" || error.code === "not_found")
+		) {
+			return null;
+		}
+		throw error;
+	}
 }
 
 export async function fetchIndexViaCustodian(logger: Logger): Promise<string> {

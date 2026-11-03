@@ -65,4 +65,22 @@ export class RevokeCertResponseDto {
 		example: "Certificate 1006 revoked successfully and CRL regenerated.",
 	})
 	message: string;
+
+	@ApiProperty({
+		description:
+			"Who made the CRL carrying the revocation. published: the CA custodian published it (ADR-024). " +
+			"pending: the revocation is recorded and the custodian keeps retrying its CRL. " +
+			"signaled: the CRL renewer was signalled. signal_failed: the revocation is recorded but the renewer " +
+			"could not be signalled (its daily run publishes it). regenerated: regenerated in-process (development). " +
+			"pending and signal_failed are answered with HTTP 202 Accepted: the revocation stands, its CRL is not out yet.",
+		enum: [
+			"published",
+			"pending",
+			"signaled",
+			"signal_failed",
+			"regenerated",
+		],
+		example: "published",
+	})
+	crl: "published" | "pending" | "signaled" | "signal_failed" | "regenerated";
 }
