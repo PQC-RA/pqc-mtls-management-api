@@ -52,6 +52,16 @@ describe("crlAfterRevocation (ADR-024)", () => {
 		);
 	});
 
+	it("a sentinel that cannot be written is reported as signal_failed, never as signaled", async () => {
+		writeFileSync.mockImplementationOnce(() => {
+			throw new Error("EACCES");
+		});
+		await expect(crlAfterRevocation(logger, [{}])).resolves.toBe(
+			"signal_failed"
+		);
+		expect(logger.error).toHaveBeenCalled();
+	});
+
 	it("no successful revocation at all: the renewer is still asked, as before", async () => {
 		await expect(crlAfterRevocation(logger, [])).resolves.toBe("signaled");
 		expect(writeFileSync).toHaveBeenCalled();

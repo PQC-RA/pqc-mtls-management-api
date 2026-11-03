@@ -1171,6 +1171,7 @@ export class CertsService implements OnModuleInit, OnModuleDestroy {
 				published: `Certificate ${normalizedSerial} revoked successfully; the CA custodian published a CRL carrying it.`,
 				pending: `Certificate ${normalizedSerial} revoked successfully; the CA custodian has not published its CRL yet and keeps retrying.`,
 				signaled: `Certificate ${normalizedSerial} revoked successfully; CRL regeneration signaled to the renewer.`,
+				signal_failed: `Certificate ${normalizedSerial} revoked in the CA database, but the CRL renewer could not be signalled; its daily run will publish it.`,
 				regenerated: `Certificate ${normalizedSerial} revoked successfully and CRL regenerated.`,
 			};
 			return { message: messages[mode], crl: mode };

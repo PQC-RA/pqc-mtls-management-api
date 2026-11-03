@@ -455,7 +455,12 @@ export class RenewService {
 		// (ADR-024); otherwise the renewer is signalled, as before. If no
 		// revocation succeeded there is nothing to publish, but the renewer is
 		// still asked, as before, so a half-done revocation is picked up.
-		await attempt("crl", () => crlAfterRevocation(this.logger, revoked));
+		await attempt("crl", async () => {
+			const mode = await crlAfterRevocation(this.logger, revoked);
+			if (mode === "signal_failed" || mode === "pending") {
+				throw new Error(`CRL not yet published (${mode})`);
+			}
+		});
 		const line = JSON.stringify({
 			ts: new Date().toISOString(),
 			event: "renew.conflict",

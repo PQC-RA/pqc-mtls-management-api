@@ -324,19 +324,22 @@ export interface CustodianRevokeResult {
 	crlNumber?: string;
 }
 
+export const REVOKE_TIMEOUT_MS = 15_000;
+
 export async function revokeViaCustodian(
 	logger: Logger,
 	serialNumber: string,
 	reason?: string
 ): Promise<CustodianRevokeResult> {
+	// The custodian answers a revocation within its own deadline (8 s,
+	// REVOKE_CRL_DEADLINE_MS in custodian.js): 200 once the CRL is out, 202 if
+	// it is not by then. This timeout is kept well above that, so a slow CRL
+	// arrives here as a 202, never as a timeout (502, ambiguous).
 	const answer = await custodianRequest<{
 		ok: true;
 		crl?: unknown;
 		crlNumber?: unknown;
-	}>(logger, "POST", "/revoke", {
-		serialNumber,
-		reason,
-	});
+	}>(logger, "POST", "/revoke", { serialNumber, reason }, REVOKE_TIMEOUT_MS);
 	const crl =
 		answer.crl === "published" || answer.crl === "pending"
 			? answer.crl
@@ -350,8 +353,11 @@ export async function revokeViaCustodian(
 
 /**
  * Asks the custodian to issue a CRL now (an operator's forced renewal).
- * Returns null when the custodian does not issue CRLs (404 not_crl_issuer):
- * the CRL renewer is still in place and the caller uses it instead.
+ * Returns null when the custodian does not issue CRLs: the CRL renewer is
+ * still in place and the caller uses it instead. That answer is 404 in two
+ * forms: `not_crl_issuer` from a custodian that has the endpoint with its CRL
+ * issuer off (ADR-024 PR 2), and `not_found` from one that predates the
+ * endpoint (main before PR 2), so this side works in either deploy order.
  */
 export async function issueCrlViaCustodian(
 	logger: Logger
@@ -371,7 +377,8 @@ export async function issueCrlViaCustodian(
 	} catch (error) {
 		if (
 			error instanceof CustodianHttpException &&
-			error.code === "not_crl_issuer"
+			error.getStatus() === HttpStatus.NOT_FOUND &&
+			(error.code === "not_crl_issuer" || error.code === "not_found")
 		) {
 			return null;
 		}

@@ -57,6 +57,12 @@ export class CrlService {
 			}
 
 			const mode = await triggerCrlRegeneration(this.logger);
+			if (mode === "signal_failed") {
+				throw new HttpException(
+					"The CRL renewer could not be signalled",
+					HttpStatus.INTERNAL_SERVER_ERROR
+				);
+			}
 			return {
 				message:
 					mode === "signaled"

@@ -272,15 +272,41 @@ describe("CertsController", () => {
 			fpr: "f".repeat(64),
 			role: "admin" as const,
 		};
+		const res = { status: jest.fn() };
 		const result = await controller.revokeCertificate(
 			{ serial: "1006", reason: RevocationReason.KeyCompromise },
-			identity
+			identity,
+			res as never
 		);
 		expect(result.message).toMatch(/revoked/i);
+		expect(res.status).not.toHaveBeenCalled();
 		expect(certsService.revokeCertificate).toHaveBeenCalledWith(
 			"1006",
 			RevocationReason.KeyCompromise,
 			identity.fpr
 		);
 	});
+
+	it.each([
+		["pending", 202],
+		["signal_failed", 202],
+		["published", undefined],
+		["signaled", undefined],
+	] as const)(
+		"revokeCertificate with crl=%s answers %s (202 Accepted end to end while no CRL carries it, ADR-024 decision 7)",
+		async (crl, status) => {
+			certsService.revokeCertificate.mockResolvedValue({
+				message: "x",
+				crl,
+			});
+			const res = { status: jest.fn() };
+			await controller.revokeCertificate(
+				{ serial: "1006", reason: RevocationReason.KeyCompromise },
+				{ sub: "a", fpr: "f".repeat(64), role: "admin" as const },
+				res as never
+			);
+			if (status) expect(res.status).toHaveBeenCalledWith(status);
+			else expect(res.status).not.toHaveBeenCalled();
+		}
+	);
 });

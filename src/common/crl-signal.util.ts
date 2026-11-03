@@ -9,7 +9,9 @@ import { PKI_CONFIG } from "@/common/config/pki.config";
 
 const execFileAsync = promisify(execFile);
 
-export type CrlRegenMode = "signaled" | "regenerated";
+// signal_failed: the CA database changed but the renewer could not be told;
+// its daily run still picks the change up. Never reported as "signaled".
+export type CrlRegenMode = "signaled" | "signal_failed" | "regenerated";
 export type CrlAfterRevocation = CrlRegenMode | "published" | "pending";
 
 /**
@@ -77,6 +79,7 @@ export async function triggerCrlRegeneration(
 					`${signalFile}: ${(err as Error).message}. The periodic renewer ` +
 					`will still pick it up; run pqc-crl-renew.sh manually to refresh now.`
 			);
+			return "signal_failed";
 		}
 		return "signaled";
 	}

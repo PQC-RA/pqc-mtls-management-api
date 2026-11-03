@@ -164,6 +164,15 @@ describe("ca-custodian.util", () => {
 			await expect(issueCrlViaCustodian(logger)).resolves.toBeNull();
 		});
 
+		it("issueCrlViaCustodian returns null for a custodian that predates the endpoint (main's own 404 body)", async () => {
+			// custodian.js on main answers an unknown route with exactly this.
+			global.fetch = custodianAnswer(404, {
+				error: "not_found",
+				message: "No such endpoint",
+			});
+			await expect(issueCrlViaCustodian(logger)).resolves.toBeNull();
+		});
+
 		it("issueCrlViaCustodian does not hide other errors", async () => {
 			global.fetch = custodianAnswer(500, {
 				error: "crl_failed",
