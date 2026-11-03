@@ -9,7 +9,10 @@ import * as fs from "fs";
 import { HttpException, HttpStatus } from "@nestjs/common";
 import { Test, TestingModule } from "@nestjs/testing";
 
-import { fetchCrlViaCustodian } from "@/common/ca-custodian.util";
+import {
+	fetchCrlViaCustodian,
+	issueCrlViaCustodian,
+} from "@/common/ca-custodian.util";
 import { CrlService } from "@/crl/crl.service";
 
 const existsSync = jest.mocked(fs.existsSync);
@@ -89,6 +92,31 @@ describe("CrlService", () => {
 	// ── renewCrl ────────────────────────────────────────────────────────────────
 
 	describe("renewCrl", () => {
+		const issueCrl = jest.mocked(issueCrlViaCustodian);
+		afterEach(() => issueCrl.mockReset());
+
+		it("asks the custodian when it is the CRL issuer (ADR-024), and runs no script", async () => {
+			issueCrl.mockResolvedValue({ crlNumber: "0x10FA" });
+			const { execFile } = require("child_process");
+			execFile.mockClear();
+			const result = await service.renewCrl();
+			expect(result.message).toBe(
+				"CRL issued by the CA custodian (number 0x10FA)"
+			);
+			expect(execFile).not.toHaveBeenCalled();
+		});
+
+		it("keeps a custodian that is down or not ready a retryable 503", async () => {
+			// This module is auto-mocked, so a real HttpException stands in
+			// for the CustodianHttpException (503) the client throws.
+			issueCrl.mockRejectedValue(
+				new HttpException("not ready", HttpStatus.SERVICE_UNAVAILABLE)
+			);
+			await expect(service.renewCrl()).rejects.toMatchObject({
+				status: HttpStatus.SERVICE_UNAVAILABLE,
+			});
+		});
+
 		it("returns success message when script exists and succeeds", async () => {
 			existsSync.mockReturnValue(true);
 			const { execFile } = require("child_process");

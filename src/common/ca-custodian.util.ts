@@ -120,9 +120,15 @@ async function custodianRequest<T>(
 		logger.error(
 			`CA custodian call failed (${method} ${pathSegment}): ${message} [${code ?? "no code"}, ${kind}]`
 		);
+		// Unreachable (the request never left): the CA is unavailable, a
+		// retryable 503. Possibly delivered: 502, the caller must reconcile.
 		throw new CustodianHttpException(
-			"Failed to contact CA custodian",
-			HttpStatus.BAD_GATEWAY,
+			kind === "not_sent"
+				? "CA custodian is unavailable"
+				: "Failed to contact CA custodian",
+			kind === "not_sent"
+				? HttpStatus.SERVICE_UNAVAILABLE
+				: HttpStatus.BAD_GATEWAY,
 			kind,
 			code
 		);
@@ -177,6 +183,20 @@ async function custodianRequest<T>(
 	if (!response.ok) {
 		const code =
 			typeof payload.error === "string" ? payload.error : undefined;
+		// The custodian refused before doing anything: it is stopping, or (as
+		// the CRL issuer, ADR-024) has not published its first CRL yet. Nothing
+		// was signed or revoked; retry later.
+		if (
+			response.status === 503 &&
+			(code === "stopping" || code === "not_ready")
+		) {
+			throw new CustodianHttpException(
+				payload.message ?? "CA custodian is not ready",
+				HttpStatus.SERVICE_UNAVAILABLE,
+				"not_sent",
+				code
+			);
+		}
 		const mayHaveIssued = payload.mayHaveIssued === true;
 		if (response.status >= 400 && response.status < 500 && !mayHaveIssued) {
 			const status =
@@ -292,15 +312,71 @@ export async function freezeLineageViaCustodian(
 	await custodianRequest(logger, "POST", "/lineage/freeze", { serialNumber });
 }
 
+/**
+ * What the custodian did about the CRL for a revocation. Absent when the
+ * custodian does not issue CRLs (the CRL renewer does): the caller must then
+ * have the renewer regenerate it. With ADR-024's CRL issuer on, "published"
+ * means a CRL carrying the revocation is out (200); "pending" means the
+ * revocation is recorded and the custodian keeps retrying the CRL (202).
+ */
+export interface CustodianRevokeResult {
+	crl?: "published" | "pending";
+	crlNumber?: string;
+}
+
 export async function revokeViaCustodian(
 	logger: Logger,
 	serialNumber: string,
 	reason?: string
-): Promise<void> {
-	await custodianRequest<{ ok: true }>(logger, "POST", "/revoke", {
+): Promise<CustodianRevokeResult> {
+	const answer = await custodianRequest<{
+		ok: true;
+		crl?: unknown;
+		crlNumber?: unknown;
+	}>(logger, "POST", "/revoke", {
 		serialNumber,
 		reason,
 	});
+	const crl =
+		answer.crl === "published" || answer.crl === "pending"
+			? answer.crl
+			: undefined;
+	return {
+		crl,
+		crlNumber:
+			typeof answer.crlNumber === "string" ? answer.crlNumber : undefined,
+	};
+}
+
+/**
+ * Asks the custodian to issue a CRL now (an operator's forced renewal).
+ * Returns null when the custodian does not issue CRLs (404 not_crl_issuer):
+ * the CRL renewer is still in place and the caller uses it instead.
+ */
+export async function issueCrlViaCustodian(
+	logger: Logger
+): Promise<{ crlNumber?: string } | null> {
+	try {
+		const answer = await custodianRequest<{ crlNumber?: unknown }>(
+			logger,
+			"POST",
+			"/crl/issue"
+		);
+		return {
+			crlNumber:
+				typeof answer.crlNumber === "string"
+					? answer.crlNumber
+					: undefined,
+		};
+	} catch (error) {
+		if (
+			error instanceof CustodianHttpException &&
+			error.code === "not_crl_issuer"
+		) {
+			return null;
+		}
+		throw error;
+	}
 }
 
 export async function fetchIndexViaCustodian(logger: Logger): Promise<string> {

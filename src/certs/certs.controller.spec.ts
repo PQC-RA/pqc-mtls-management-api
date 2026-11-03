@@ -265,6 +265,7 @@ describe("CertsController", () => {
 		certsService.revokeCertificate.mockResolvedValue({
 			message:
 				"Certificate 1006 revoked successfully and CRL regenerated.",
+			crl: "regenerated",
 		});
 		const identity = {
 			sub: "some-other-admin",

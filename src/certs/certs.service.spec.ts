@@ -87,7 +87,7 @@ describe("CertsService", () => {
 			caCustodianUtil,
 			"fetchIssuedPemViaCustodian"
 		).mockResolvedValue(FAKE_CERT_PEM);
-		jest.spyOn(caCustodianUtil, "revokeViaCustodian").mockResolvedValue();
+		jest.spyOn(caCustodianUtil, "revokeViaCustodian").mockResolvedValue({});
 		jest.spyOn(caCustodianUtil, "signCsrViaCustodian").mockResolvedValue({
 			certificate: FAKE_CERT_PEM,
 			serialNumber: "1007",
@@ -1006,7 +1006,7 @@ describe("CertsService", () => {
 			] as never);
 			const revoke = jest
 				.spyOn(caCustodianUtil, "revokeViaCustodian")
-				.mockResolvedValue();
+				.mockResolvedValue({});
 
 			await service.revokeCertificate(
 				"1006",
@@ -1023,6 +1023,39 @@ describe("CertsService", () => {
 			);
 		});
 
+		it.each([
+			["published", /published a CRL carrying it/],
+			["pending", /keeps retrying/],
+		] as const)(
+			"the custodian as CRL issuer (ADR-024) answered %s: no renewer signal, and the answer says so",
+			async (crl, message) => {
+				indexParser.parseIndexFile.mockResolvedValue([
+					makeCert("V", 90, "1006"),
+				] as never);
+				jest.spyOn(
+					caCustodianUtil,
+					"revokeViaCustodian"
+				).mockResolvedValue({
+					crl,
+					crlNumber: crl === "published" ? "0x10" : undefined,
+				});
+				const write = jest.mocked(fs.writeFileSync);
+				write.mockClear();
+				const result = await service.revokeCertificate(
+					"1006",
+					"keyCompromise",
+					OTHER_CALLER_FPR
+				);
+				expect(result.crl).toBe(crl);
+				expect(result.message).toMatch(message);
+				expect(write).not.toHaveBeenCalledWith(
+					expect.stringContaining("renew-crl"),
+					expect.anything(),
+					expect.anything()
+				);
+			}
+		);
+
 		it("includes -crl_reason flag for non-unspecified reasons", async () => {
 			indexParser.parseIndexFile.mockResolvedValue([
 				makeCert("V", 90, "1006"),
@@ -1031,7 +1064,7 @@ describe("CertsService", () => {
 
 			const revoke = jest
 				.spyOn(caCustodianUtil, "revokeViaCustodian")
-				.mockResolvedValue();
+				.mockResolvedValue({});
 
 			await service.revokeCertificate(
 				"1006",

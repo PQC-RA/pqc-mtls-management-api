@@ -2,7 +2,10 @@ import * as fs from "fs";
 
 import { HttpException, HttpStatus, Injectable, Logger } from "@nestjs/common";
 
-import { fetchCrlViaCustodian } from "@/common/ca-custodian.util";
+import {
+	fetchCrlViaCustodian,
+	issueCrlViaCustodian,
+} from "@/common/ca-custodian.util";
 import { PKI_CONFIG } from "@/common/config/pki.config";
 import { triggerCrlRegeneration } from "@/common/crl-signal.util";
 
@@ -26,6 +29,16 @@ export class CrlService {
 		this.logger.log("Executing forced CRL renewal");
 
 		try {
+			// ADR-024: when the custodian issues CRLs, it does this one too.
+			// null means it does not (404 not_crl_issuer): fall through to the
+			// renewer, as before.
+			const issued = await issueCrlViaCustodian(this.logger);
+			if (issued) {
+				return {
+					message: `CRL issued by the CA custodian${issued.crlNumber ? ` (number ${issued.crlNumber})` : ""}`,
+				};
+			}
+
 			// Production: signal the dedicated crl-renewer (least privilege).
 			// Dev/single-container: regenerate in-process. The in-process branch
 			// short-circuits to a dry-run message when the script is absent.
@@ -52,6 +65,14 @@ export class CrlService {
 			};
 		} catch (error) {
 			this.logger.error(`Failed to renew CRL: ${error.message}`);
+			// A custodian that is down or not ready is a retryable 503, as
+			// elsewhere; anything else stays a 500.
+			if (
+				error instanceof HttpException &&
+				error.getStatus() === HttpStatus.SERVICE_UNAVAILABLE
+			) {
+				throw error;
+			}
 			throw new HttpException(
 				"CRL renewal failed",
 				HttpStatus.INTERNAL_SERVER_ERROR

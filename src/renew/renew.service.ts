@@ -11,6 +11,7 @@ import { AdminAuditService } from "@/admin-audit/admin-audit.service";
 import { CertsService } from "@/certs/certs.service";
 import {
 	CustodianHttpException,
+	type CustodianRevokeResult,
 	fetchIssuedPemViaCustodian,
 	fetchLineageViaCustodian,
 	fetchSignResultViaCustodian,
@@ -20,7 +21,7 @@ import {
 	signCsrViaCustodian,
 } from "@/common/ca-custodian.util";
 import { PKI_CONFIG } from "@/common/config/pki.config";
-import { triggerCrlRegeneration } from "@/common/crl-signal.util";
+import { crlAfterRevocation } from "@/common/crl-signal.util";
 import { RenewAttestation } from "@/renew/renew-attest.guard";
 import { RenewDto, RenewResponseDto } from "@/renew/renew.dto";
 
@@ -437,13 +438,24 @@ export class RenewService {
 		await attempt("freeze", () =>
 			freezeLineageViaCustodian(this.logger, predecessor)
 		);
+		const revoked: CustodianRevokeResult[] = [];
 		for (const s of [predecessor, successor]) {
 			if (s)
-				await attempt(`revoke ${s}`, () =>
-					revokeViaCustodian(this.logger, s, "keyCompromise")
-				);
+				await attempt(`revoke ${s}`, async () => {
+					revoked.push(
+						await revokeViaCustodian(
+							this.logger,
+							s,
+							"keyCompromise"
+						)
+					);
+				});
 		}
-		await attempt("crl", () => triggerCrlRegeneration(this.logger));
+		// The custodian publishes the CRL itself when it is the CRL issuer
+		// (ADR-024); otherwise the renewer is signalled, as before. If no
+		// revocation succeeded there is nothing to publish, but the renewer is
+		// still asked, as before, so a half-done revocation is picked up.
+		await attempt("crl", () => crlAfterRevocation(this.logger, revoked));
 		const line = JSON.stringify({
 			ts: new Date().toISOString(),
 			event: "renew.conflict",

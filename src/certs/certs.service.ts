@@ -33,7 +33,10 @@ import {
 	signCsrViaCustodian,
 } from "@/common/ca-custodian.util";
 import { PKI_CONFIG } from "@/common/config/pki.config";
-import { triggerCrlRegeneration } from "@/common/crl-signal.util";
+import {
+	crlAfterRevocation,
+	type CrlAfterRevocation,
+} from "@/common/crl-signal.util";
 
 import { singleCommonName, SubjectDnError } from "../common/subject-dn.util";
 
@@ -1095,7 +1098,7 @@ export class CertsService implements OnModuleInit, OnModuleDestroy {
 		serial: string,
 		reason: string,
 		callerFingerprint: string
-	): Promise<{ message: string }> {
+	): Promise<{ message: string; crl: CrlAfterRevocation }> {
 		// Normalise and strictly validate the serial before it touches any file path
 		// or shell argument.  normalizeSerial throws 400 for non-hex input.
 		const normalizedSerial = this.normalizeSerial(serial);
@@ -1144,23 +1147,24 @@ export class CertsService implements OnModuleInit, OnModuleDestroy {
 			// reasonCode extension MUST be omitted. Revocation itself – the only
 			// step that touches the private key – happens in the pqc-ca-custodian
 			// sidecar; it also owns the not-found/already-revoked checks now.
-			await revokeViaCustodian(
+			const answer = await revokeViaCustodian(
 				this.logger,
 				normalizedSerial,
 				reason !== "unspecified" ? reason : undefined
 			);
 
-			// Propagate the revocation into a fresh CRL. In production this is
-			// delegated to the dedicated crl-renewer (least privilege); in dev it
-			// runs in-process. See triggerCrlRegeneration for the rationale.
-			const mode = await triggerCrlRegeneration(this.logger);
+			// Propagate the revocation into a fresh CRL: done by the custodian
+			// itself when it is the CRL issuer (ADR-024), otherwise by the
+			// crl-renewer. See crlAfterRevocation.
+			const mode = await crlAfterRevocation(this.logger, [answer]);
 
-			return {
-				message:
-					mode === "signaled"
-						? `Certificate ${normalizedSerial} revoked successfully; CRL regeneration signaled to the renewer.`
-						: `Certificate ${normalizedSerial} revoked successfully and CRL regenerated.`,
+			const messages: Record<typeof mode, string> = {
+				published: `Certificate ${normalizedSerial} revoked successfully; the CA custodian published a CRL carrying it.`,
+				pending: `Certificate ${normalizedSerial} revoked successfully; the CA custodian has not published its CRL yet and keeps retrying.`,
+				signaled: `Certificate ${normalizedSerial} revoked successfully; CRL regeneration signaled to the renewer.`,
+				regenerated: `Certificate ${normalizedSerial} revoked successfully and CRL regenerated.`,
 			};
+			return { message: messages[mode], crl: mode };
 		} catch (error) {
 			this.logger.error(`Failed to revoke certificate: ${error.message}`);
 			if (error instanceof HttpException) throw error;
