@@ -10,7 +10,7 @@ export class HealthIndicatorResultDto {
 
 	@ApiPropertyOptional({
 		description: "Additional detail about the indicator's state",
-		example: { caIndexFile: true, crlFile: true, renewScript: true },
+		example: { caDatabase: "OK", crl: "OK", crlIssuer: "pqc-ca-custodian" },
 	})
 	details?: Record<string, unknown>;
 }

@@ -448,9 +448,12 @@ export async function fetchCrlViaCustodian(
  * just booleans). Used by health.service.indicator.ts in place of the local
  * CA-tree file checks it ran before this process stopped mounting the tree.
  */
-export async function checkCustodianHealth(
-	logger: Logger
-): Promise<{ ok: boolean; indexOk?: boolean; crlOk?: boolean }> {
+export async function checkCustodianHealth(logger: Logger): Promise<{
+	ok: boolean;
+	indexOk?: boolean;
+	crlOk?: boolean;
+	crlIssuerOk?: boolean;
+}> {
 	try {
 		const response = await fetch(`${PKI_CONFIG.custodianUrl}/healthz`, {
 			signal: AbortSignal.timeout(5_000),
@@ -459,11 +462,19 @@ export async function checkCustodianHealth(
 			ok?: boolean;
 			indexOk?: boolean;
 			crlOk?: boolean;
+			crlIssuerOk?: boolean;
 		};
+		// crlIssuerOk is present only when the custodian issues the CRLs itself
+		// (ADR-024); a custodian from before ADR-024 does not send it. Only a
+		// real boolean counts, so a malformed answer never selects the mode.
 		return {
 			ok: response.ok && payload.ok === true,
 			indexOk: payload.indexOk,
 			crlOk: payload.crlOk,
+			crlIssuerOk:
+				typeof payload.crlIssuerOk === "boolean"
+					? payload.crlIssuerOk
+					: undefined,
 		};
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);

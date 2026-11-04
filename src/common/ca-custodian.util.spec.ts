@@ -3,6 +3,7 @@ import * as crypto from "crypto";
 import { HttpStatus, Logger } from "@nestjs/common";
 
 import {
+	checkCustodianHealth,
 	CustodianHttpException,
 	issueCrlViaCustodian,
 	revokeViaCustodian,
@@ -218,6 +219,55 @@ describe("ca-custodian.util", () => {
 			expect((err as CustodianHttpException).getStatus()).toBe(
 				HttpStatus.BAD_GATEWAY
 			);
+		});
+	});
+
+	// /healthz: crlIssuerOk tells management-api whether the custodian issues
+	// the CRLs (ADR-024); only a real boolean may select that mode.
+	describe("checkCustodianHealth", () => {
+		const healthz = (status: number, body: unknown) =>
+			jest.fn().mockResolvedValue({
+				ok: status >= 200 && status < 300,
+				status,
+				json: () => Promise.resolve(body),
+			}) as unknown as typeof fetch;
+
+		it("passes crlIssuerOk through, also on the custodian's 503", async () => {
+			global.fetch = healthz(503, {
+				ok: false,
+				indexOk: true,
+				crlOk: true,
+				crlIssuerOk: false,
+			});
+			await expect(checkCustodianHealth(logger)).resolves.toEqual({
+				ok: false,
+				indexOk: true,
+				crlOk: true,
+				crlIssuerOk: false,
+			});
+		});
+
+		it("leaves crlIssuerOk undefined for a custodian from before ADR-024", async () => {
+			global.fetch = healthz(200, {
+				ok: true,
+				indexOk: true,
+				crlOk: true,
+			});
+			const h = await checkCustodianHealth(logger);
+			expect(h.ok).toBe(true);
+			expect(h.crlIssuerOk).toBeUndefined();
+		});
+
+		it("ignores a crlIssuerOk that is not a boolean", async () => {
+			global.fetch = healthz(200, {
+				ok: true,
+				indexOk: true,
+				crlOk: true,
+				crlIssuerOk: "yes",
+			});
+			expect(
+				(await checkCustodianHealth(logger)).crlIssuerOk
+			).toBeUndefined();
 		});
 	});
 });
