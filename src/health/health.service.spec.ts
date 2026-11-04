@@ -104,6 +104,78 @@ describe("HealthService", () => {
 		);
 	});
 
+	// ADR-024: the custodian issues the CRLs and says so with crlIssuerOk.
+	// The renewer and its script are gone, so neither may be required.
+	describe("with the custodian as CRL issuer", () => {
+		const issuer = (crlIssuerOk: boolean) => ({
+			ok: crlIssuerOk,
+			indexOk: true,
+			crlOk: true,
+			crlIssuerOk,
+		});
+
+		it("reports up with no renew script and no signal file", async () => {
+			custodianHealth.mockResolvedValue(issuer(true));
+			existsSync.mockReturnValue(false);
+			const before = process.env.CRL_RENEW_SIGNAL_FILE;
+			delete process.env.CRL_RENEW_SIGNAL_FILE;
+			try {
+				const result = await service.isHealthy("pki_infrastructure");
+				expect(result.pki_infrastructure.status).toBe("up");
+				expect(mockIndicator.up).toHaveBeenCalledWith(
+					expect.objectContaining({ crlIssuer: "pqc-ca-custodian" })
+				);
+				expect(mockIndicator.up).not.toHaveBeenCalledWith(
+					expect.objectContaining({ renewScript: expect.anything() })
+				);
+			} finally {
+				if (before !== undefined)
+					process.env.CRL_RENEW_SIGNAL_FILE = before;
+			}
+		});
+
+		it("reports down when its CRL is not published or overdue", async () => {
+			custodianHealth.mockResolvedValue(issuer(false));
+			existsSync.mockReturnValue(true);
+
+			await service.isHealthy("pki_infrastructure");
+			expect(mockIndicator.down).toHaveBeenCalledWith(
+				expect.objectContaining({ crlIssuer: expect.any(String) })
+			);
+		});
+	});
+
+	it("with the renewer as issuer, a signal file stands in for the script", async () => {
+		custodianHealth.mockResolvedValue({
+			ok: true,
+			indexOk: true,
+			crlOk: true,
+		});
+		existsSync.mockReturnValue(false);
+		const before = process.env.CRL_RENEW_SIGNAL_FILE;
+		process.env.CRL_RENEW_SIGNAL_FILE = "/signals/renew-crl";
+		try {
+			const result = await service.isHealthy("pki_infrastructure");
+			expect(result.pki_infrastructure.status).toBe("up");
+			expect(mockIndicator.up).toHaveBeenCalledWith(
+				expect.objectContaining({ crlIssuer: "crl-renewer" })
+			);
+		} finally {
+			if (before === undefined) delete process.env.CRL_RENEW_SIGNAL_FILE;
+			else process.env.CRL_RENEW_SIGNAL_FILE = before;
+		}
+	});
+
+	it("with the custodian unreachable, reports only that, not a guessed issuer", async () => {
+		custodianHealth.mockResolvedValue({ ok: false });
+		existsSync.mockReturnValue(false);
+
+		await service.isHealthy("pki_infrastructure");
+		expect(mockIndicator.down).toHaveBeenCalledWith({
+			custodian: expect.any(String),
+		});
+	});
+
 	it("returns down on unexpected errors", async () => {
 		existsSync.mockImplementation(() => {
 			throw new Error("filesystem exploded");
